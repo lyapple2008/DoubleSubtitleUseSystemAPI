@@ -9,33 +9,31 @@ import AudioToolbox
 class AudioCaptureExtension: RPBroadcastSampleHandler {
 
     private let appGroupIdentifier = "group.com.doublesubtitle.app"
-    private let broadcastActiveKey = "isBroadcastActive"
     /// 用文件表示广播已开始，避免 Extension 内 UserDefaults(suiteName:) 触发 CFPrefs 导致主 App 读不到
     private let broadcastActiveFileName = "broadcast_active"
 
-    /// 主 App 读取的格式 key（Extension 写 raw 时写入，主 App 据此做采样率转换）
-    static let audioFormatSampleRateKey = "audioFormatSampleRate"
-    static let audioFormatChannelsKey = "audioFormatChannels"
-    static let audioFormatFloatKey = "audioFormatFloat"
-    static let audioFormatInterleavedKey = "audioFormatInterleaved"
-
     private static let targetSampleRate: Double = 16000
     private static let targetChannels: AVAudioChannelCount = 1
-    static let audioFormatBitsPerChannelKey = "audioFormatBitsPerChannel"
 
     private var asbdLoggedOnce = false
 
     // Debug: 直接 dump CMBlockBuffer 原始字节（零解析），用于验证系统捕获的数据
+    private let enableRawDump = false
     private var debugDumpFileHandle: FileHandle?
     private var debugDumpBytesWritten: UInt64 = 0
+    private var converter: AVAudioConverter?
+    private var converterSourceFormatKey: String?
+    private var convertLogCount = 0
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         print("[AudioCaptureExtension] Broadcast started with setup info: \(setupInfo ?? [:])")
+        resetConverter()
         setBroadcastActive(true)
     }
 
     override func broadcastFinished() {
         print("[AudioCaptureExtension] Broadcast finished")
+        resetConverter()
         closeDebugDumpFile()
         setBroadcastActive(false)
     }
@@ -53,7 +51,6 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
         if sampleBufferType != .audioApp { return }
-
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
             print("[AudioCaptureExtension] No format description")
@@ -94,19 +91,13 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
         let frameCount = length / totalBytesPerFrame
         guard frameCount > 0 else { return }
 
-        // 直接 dump 原始字节到文件（零格式解析）
-        appendToDebugDumpFile(data: data, length: length, asbd: asbd)
-
-        let dataToWrite: Data
-        let needSampleRateConversion = abs(Double(asbd.mSampleRate) - Self.targetSampleRate) > 1
-        if needSampleRateConversion {
-            writeRawFormatToUserDefaults(asbd: asbd)
-            dataToWrite = Data(bytes: data, count: length)
-        } else if let pcm16kData = convertTo16kMonoInt16(source: data, sourceLength: length, asbd: asbd, frameCount: frameCount) {
-            dataToWrite = pcm16kData
-        } else {
-            writeRawFormatToUserDefaults(asbd: asbd)
-            dataToWrite = Data(bytes: data, count: length)
+        // 仅在需要时 dump 原始字节，避免 Extension 实时路径被磁盘 IO 拖慢
+        if enableRawDump {
+            appendToDebugDumpFile(data: data, length: length, asbd: asbd)
+        }
+        guard let dataToWrite = convertTo16kMonoInt16(source: data, sourceLength: length, asbd: asbd, frameCount: frameCount) else {
+            print("[AudioCaptureExtension] convertTo16kMonoInt16 failed, dropping current audio chunk")
+            return
         }
         writeAudioDataToSharedContainer(dataToWrite)
     }
@@ -127,7 +118,7 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
             return nil
         }
         guard let destFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Self.targetSampleRate, channels: Self.targetChannels, interleaved: false),
-              let converter = AVAudioConverter(from: sourceFormat, to: destFormat) else {
+              let converter = getOrCreateConverter(for: sourceFormat) else {
             print("[AudioCaptureExtension] Failed to create destFormat or converter")
             return nil
         }
@@ -137,42 +128,84 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
             return nil
         }
 
-        // AVAudioConverter 要求 outputBuffer.frameCapacity >= inputBuffer.frameLength，否则崩溃
+        // 输出容量按目标采样率估算；使用循环 drain，拿完整个输入块可产出的所有数据。
         let ratio = Self.targetSampleRate / sampleRate
-        let estimatedOutFrames = AVAudioFrameCount(Double(frameCount) * ratio) + 1
-        let inputFrames = AVAudioFrameCount(frameCount)
-        let outFrameCapacity = max(estimatedOutFrames, inputFrames)
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: destFormat, frameCapacity: outFrameCapacity) else {
-            return nil
-        }
+        let estimatedOutFrames = AVAudioFrameCount(Double(frameCount) * ratio) + 64
+        let outFrameCapacity = max(estimatedOutFrames, 128)
+        var outputData = Data()
+        var sawOutput = false
+        var sawStatus: AVAudioConverterOutputStatus = .inputRanDry
 
-        // 使用 block-based API 以支持采样率转换（简单 convert(to:from:) 不支持 SRC）
         var inputProvided = false
         var convertError: NSError?
-        let convertStatus = converter.convert(to: outBuffer, error: &convertError) { _, outStatus in
-            if inputProvided {
-                outStatus.pointee = .endOfStream
+
+        while true {
+            guard let outBuffer = AVAudioPCMBuffer(pcmFormat: destFormat, frameCapacity: outFrameCapacity) else {
                 return nil
             }
-            inputProvided = true
-            outStatus.pointee = .haveData
-            return srcBuffer
-        }
-        if let convertError = convertError {
-            print("[AudioCaptureExtension] Convert error: \(convertError.localizedDescription)")
-            return nil
-        }
-        if convertStatus == .error {
-            print("[AudioCaptureExtension] Convert status=error")
-            return nil
-        }
-        if outBuffer.frameLength == 0 {
-            return nil
+            outBuffer.frameLength = 0
+
+            let status = converter.convert(to: outBuffer, error: &convertError) { _, outStatus in
+                if inputProvided {
+                    outStatus.pointee = .noDataNow
+                    return nil
+                }
+                inputProvided = true
+                outStatus.pointee = .haveData
+                return srcBuffer
+            }
+            sawStatus = status
+
+            if let convertError = convertError {
+                print("[AudioCaptureExtension] Convert error: \(convertError.localizedDescription)")
+                return nil
+            }
+            if status == .error {
+                print("[AudioCaptureExtension] Convert status=error")
+                return nil
+            }
+
+            let outFrames = Int(outBuffer.frameLength)
+            if outFrames > 0, let channelData = outBuffer.int16ChannelData {
+                outputData.append(Data(bytes: channelData[0], count: outFrames * 2))
+                sawOutput = true
+            }
+
+            // haveData: 继续 drain；其余状态表示当前输入块已无更多可读输出。
+            if status != .haveData {
+                break
+            }
         }
 
-        let outFrames = Int(outBuffer.frameLength)
-        guard outFrames > 0, let channelData = outBuffer.int16ChannelData else { return nil }
-        return Data(bytes: channelData[0], count: outFrames * 2)
+        if convertLogCount < 8 {
+            let outFramesTotal = outputData.count / 2
+            print("[AudioCaptureExtension] convert stats inFrames=\(frameCount) inRate=\(Int(sampleRate)) outFrames=\(outFramesTotal) outRate=16000 status=\(sawStatus.rawValue)")
+            convertLogCount += 1
+        }
+
+        guard sawOutput, !outputData.isEmpty else {
+            return nil
+        }
+        return outputData
+    }
+
+    private func resetConverter() {
+        converter = nil
+        converterSourceFormatKey = nil
+    }
+
+    private func getOrCreateConverter(for sourceFormat: AVAudioFormat) -> AVAudioConverter? {
+        let key = "\(sourceFormat.commonFormat.rawValue)-\(sourceFormat.sampleRate)-\(sourceFormat.channelCount)-\(sourceFormat.isInterleaved)"
+        if converter == nil || converterSourceFormatKey != key {
+            guard let destFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Self.targetSampleRate, channels: Self.targetChannels, interleaved: false),
+                  let newConverter = AVAudioConverter(from: sourceFormat, to: destFormat) else {
+                return nil
+            }
+            converter = newConverter
+            converterSourceFormatKey = key
+            print("[AudioCaptureExtension] Rebuilt converter for source format: \(key)")
+        }
+        return converter
     }
 
     private func createSourceFormat(asbd: AudioStreamBasicDescription) -> AVAudioFormat? {
@@ -184,10 +217,11 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
         let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
         let channels = AVAudioChannelCount(asbd.mChannelsPerFrame)
         let sampleRate = asbd.mSampleRate
+        let interleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
         if isFloat {
-            return AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: channels, interleaved: (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0)
+            return AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: channels, interleaved: interleaved)
         } else if asbd.mBitsPerChannel == 16 {
-            return AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: sampleRate, channels: channels, interleaved: (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0)
+            return AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: sampleRate, channels: channels, interleaved: interleaved)
         }
         return nil
     }
@@ -228,19 +262,6 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
             } else { return nil }
         }
         return buffer
-    }
-
-    private func writeRawFormatToUserDefaults(asbd: AudioStreamBasicDescription) {
-        guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else { return }
-        let formatURL = containerURL.appendingPathComponent("audio_format.plist")
-        let dict: [String: Any] = [
-            Self.audioFormatSampleRateKey: asbd.mSampleRate,
-            Self.audioFormatChannelsKey: Int(asbd.mChannelsPerFrame),
-            Self.audioFormatFloatKey: (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
-            Self.audioFormatInterleavedKey: (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0,
-            Self.audioFormatBitsPerChannelKey: Int(asbd.mBitsPerChannel)
-        ]
-        try? (dict as NSDictionary).write(to: formatURL)
     }
 
     // MARK: - Debug: 直接 dump CMBlockBuffer 原始字节到文件（零格式解析）
@@ -309,4 +330,5 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
             print("[AudioCaptureExtension] Failed to write: \(error.localizedDescription)")
         }
     }
+
 }

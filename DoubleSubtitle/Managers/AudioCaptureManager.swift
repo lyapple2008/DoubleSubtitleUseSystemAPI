@@ -71,50 +71,6 @@ struct BroadcastPickerView: UIViewRepresentable {
     }
 }
 
-/// Container view for broadcast picker with instructions
-struct BroadcastPickerContainerView: View {
-    var preferredExtension: String?
-    var onDismiss: (() -> Void)?
-    @State private var pickerTapped = false
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.4)
-                .ignoresSafeArea()
-                .onTapGesture {
-                    onDismiss?()
-                }
-
-            VStack(spacing: 20) {
-                Text("点击下方按钮，在系统弹窗中选择「双语字幕」并点击「开始直播」")
-                    .font(.headline)
-                    .foregroundColor(.white)
-                    .multilineTextAlignment(.center)
-
-                // Broadcast picker - triggers system RPSystemBroadcastPickerView
-                BroadcastPickerView(preferredExtension: preferredExtension, trigger: .constant(false))
-                    .frame(width: 80, height: 80)
-                    .background(Color.white)
-                    .cornerRadius(40)
-
-                Text("仅当您点击「开始直播」后才会开始捕获音频")
-                    .font(.caption)
-                    .foregroundColor(.white.opacity(0.8))
-                    .multilineTextAlignment(.center)
-
-                Button("取消") {
-                    onDismiss?()
-                }
-                .foregroundColor(.white)
-                .padding(.top, 20)
-            }
-            .padding(30)
-            .background(Color(.systemGray5))
-            .cornerRadius(16)
-        }
-    }
-}
-
 /// Modified AudioCaptureManager that doesn't require UIView embedding
 final class AudioCaptureManager: NSObject {
     static let shared = AudioCaptureManager()
@@ -123,20 +79,13 @@ final class AudioCaptureManager: NSObject {
     weak var delegate: AudioCaptureDelegate?
 
     private let appGroupIdentifier = "group.com.doublesubtitle.app"
-    private let broadcastActiveKey = "isBroadcastActive"
     /// Extension 通过该文件通知广播已开始，避免 UserDefaults 在 Extension 内异常导致主 App 读不到
     private let broadcastActiveFileName = "broadcast_active"
-    /// Extension 写 raw 时写入的格式 key，主 App 据此做采样率/声道转换
-    private let audioFormatSampleRateKey = "audioFormatSampleRate"
-    private let audioFormatChannelsKey = "audioFormatChannels"
-    private let audioFormatFloatKey = "audioFormatFloat"
-    private let audioFormatInterleavedKey = "audioFormatInterleaved"
-    private let audioFormatBitsPerChannelKey = "audioFormatBitsPerChannel"
     private var isRecording = false
     private var fileMonitorTimer: Timer?
     private var broadcastStartPollTimer: Timer?
     private var lastReadPosition: UInt64 = 0
-    private var broadcastPicker: RPSystemBroadcastPickerView?
+    private var pendingPCMByte: UInt8?
 
     // MARK: - Debug: 保存送识别前的音频到 WAV 文件
     private var debugAudioFileHandle: FileHandle?
@@ -239,6 +188,7 @@ final class AudioCaptureManager: NSObject {
 
         // Reset read position
         lastReadPosition = 0
+        pendingPCMByte = nil
 
         // Clear previous audio file
         clearSharedAudioFile()
@@ -388,157 +338,21 @@ final class AudioCaptureManager: NSObject {
         print("[\(logTag)] Debug audio file finalized: \(dataSize) bytes, \(String(format: "%.1f", totalSeconds))s")
     }
 
-    private var plistLoggedOnce = false
-
-    /// 从 App Group 容器内 audio_format.plist 读取格式（Extension 写 raw 时写入），避免依赖 UserDefaults
-    private func readRawAudioFormatFromContainer() -> (sampleRate: Double, channels: Int, isFloat: Bool, interleaved: Bool, bitsPerChannel: Int) {
-        guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
-            return (0, 0, false, false, 0)
-        }
-        let formatURL = containerURL.appendingPathComponent("audio_format.plist")
-        guard let dict = NSDictionary(contentsOf: formatURL) as? [String: Any] else {
-            return (0, 0, false, false, 0)
-        }
-        let sampleRate = (dict[audioFormatSampleRateKey] as? NSNumber)?.doubleValue ?? 0
-        let channels = (dict[audioFormatChannelsKey] as? NSNumber)?.intValue ?? 0
-        var isFloat = (dict[audioFormatFloatKey] as? NSNumber)?.boolValue ?? false
-        let interleaved = (dict[audioFormatInterleavedKey] as? NSNumber)?.boolValue ?? false
-        let bitsPerChannel = (dict[audioFormatBitsPerChannelKey] as? NSNumber)?.intValue ?? (isFloat ? 32 : 16)
-
-        // 安全校验：如果 bitsPerChannel=32 且 isFloat=false，很可能实际是 Float32（ReplayKit 常见格式）
-        if bitsPerChannel == 32 && !isFloat {
-            print("[\(logTag)] WARNING: bitsPerChannel=32 but isFloat=false, treating as Float32")
-            isFloat = true
-        }
-
-        if !plistLoggedOnce {
-            plistLoggedOnce = true
-            print("[\(logTag)] plist values: sampleRate=\(sampleRate) channels=\(channels) isFloat=\(isFloat) interleaved=\(interleaved) bitsPerChannel=\(bitsPerChannel)")
-        }
-        return (sampleRate, Int(channels), isFloat, interleaved, bitsPerChannel)
-    }
-
-    private var convertLogCount = 0
-
-    /// 根据 Extension 写入的格式将 raw 转为语音识别所需格式。
-    /// 使用 AVAudioConverter 的 block-based API（convert(to:error:withInputFrom:)）进行转换，
-    /// 因为简单的 convert(to:from:) 不支持采样率转换（会报 -50）。
+    /// Extension 已统一输出 16kHz/mono/Int16，这里按固定格式解析并传给识别模块。
     private func createPCMBufferForRecognition(from data: Data) -> AVAudioPCMBuffer? {
-        let (sampleRate, channels, isFloat, interleaved, _) = readRawAudioFormatFromContainer()
-
-        let destFormat = SpeechRecognitionManager.shared.preferredRecognitionFormat
-
-        if sampleRate <= 0 {
-            return createPCMBufferFromRaw(data, destFormat: destFormat)
-        }
-        // AVAudioPCMBuffer 的 int16ChannelData/floatChannelData 只对 non-interleaved 正常工作：
-        // interleaved 格式只有 1 个 buffer（所有声道交错），channelData[ch>0] 越界。
-        // 因此始终创建 non-interleaved 的源格式；interleaved 标志仅告知 createSourcePCMBuffer 如何解读 raw 布局。
-        let srcFormat = AVAudioFormat(
-            commonFormat: isFloat ? .pcmFormatFloat32 : .pcmFormatInt16,
-            sampleRate: sampleRate,
-            channels: AVAudioChannelCount(channels),
-            interleaved: false
-        )
-        guard let srcFormat = srcFormat else {
-            return createPCMBufferFromRaw(data, destFormat: destFormat)
-        }
-
-        let dest = destFormat ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
-
-        if convertLogCount < 3 {
-            print("[\(logTag)] srcFormat=\(srcFormat) destFormat=\(dest)")
-            convertLogCount += 1
-        }
-
-        // 源与目标完全一致，直接填 buffer
-        if srcFormat.sampleRate == dest.sampleRate, srcFormat.channelCount == dest.channelCount, srcFormat.commonFormat == dest.commonFormat {
-            let bytesPerSample = isFloat ? 4 : 2
-            let fc = data.count / (Int(srcFormat.channelCount) * bytesPerSample)
-            return createSourcePCMBuffer(from: data, format: srcFormat, frameCount: fc, channels: Int(srcFormat.channelCount), interleaved: interleaved, isFloat: isFloat)
-        }
-
-        guard let converter = AVAudioConverter(from: srcFormat, to: dest) else {
-            print("[\(logTag)] Failed to create AVAudioConverter")
-            return createPCMBufferFromRaw(data, destFormat: destFormat)
-        }
-
-        let bytesPerFrame = (isFloat ? 4 : 2) * channels
-        let frameCount = data.count / bytesPerFrame
-        guard frameCount > 0,
-              let srcBuffer = createSourcePCMBuffer(from: data, format: srcFormat, frameCount: frameCount, channels: channels, interleaved: interleaved, isFloat: isFloat) else {
-            return createPCMBufferFromRaw(data, destFormat: destFormat)
-        }
-
-        let ratio = dest.sampleRate / srcFormat.sampleRate
-        let outCapacity = AVAudioFrameCount(Double(frameCount) * ratio + 64)
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: dest, frameCapacity: outCapacity) else {
-            return createPCMBufferFromRaw(data, destFormat: destFormat)
-        }
-
-        // 使用 block-based API：支持采样率转换（简单 convert(to:from:) 不支持 SRC，报 -50）
-        var inputProvided = false
-        var convertError: NSError?
-        let status = converter.convert(to: outBuffer, error: &convertError) { _, outStatus in
-            if inputProvided {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-            inputProvided = true
-            outStatus.pointee = .haveData
-            return srcBuffer
-        }
-
-        if let convertError = convertError {
-            print("[\(logTag)] AVAudioConverter block-based convert error: \(convertError)")
-            return createPCMBufferFromRaw(data, destFormat: destFormat)
-        }
-        if status == .error {
-            print("[\(logTag)] AVAudioConverter convert status=error")
-            return createPCMBufferFromRaw(data, destFormat: destFormat)
-        }
-        guard outBuffer.frameLength > 0 else {
-            return createPCMBufferFromRaw(data, destFormat: destFormat)
-        }
-        return outBuffer
-    }
-
-    /// 无格式信息或转换失败时的回退：按 16k 单声道 Int16 解析（与常见 native 格式一致）
-    private func createPCMBufferFromRaw(_ data: Data, destFormat: AVAudioFormat?) -> AVAudioPCMBuffer? {
         guard !data.isEmpty else { return nil }
-        return createPCMBuffer16kMonoInt16(from: data)
-    }
-
-    private func createSourcePCMBuffer(from data: Data, format: AVAudioFormat, frameCount: Int, channels: Int, interleaved: Bool, isFloat: Bool) -> AVAudioPCMBuffer? {
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else { return nil }
-        buffer.frameLength = AVAudioFrameCount(frameCount)
-        let bytesPerChannel = data.count / channels
-        let bytesPerSample = isFloat ? 4 : 2
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Void in
-            guard let base = raw.baseAddress else { return }
-            if interleaved {
-                for ch in 0..<channels {
-                    if isFloat, let dst = buffer.floatChannelData?[ch] {
-                        for f in 0..<frameCount {
-                            memcpy(dst.advanced(by: f), base.advanced(by: f * (bytesPerSample * channels) + ch * bytesPerSample), bytesPerSample)
-                        }
-                    } else if let dst = buffer.int16ChannelData?[ch] {
-                        for f in 0..<frameCount {
-                            memcpy(dst.advanced(by: f), base.advanced(by: f * (bytesPerSample * channels) + ch * bytesPerSample), bytesPerSample)
-                        }
-                    }
-                }
-            } else {
-                for ch in 0..<channels {
-                    if isFloat, let dst = buffer.floatChannelData?[ch] {
-                        memcpy(dst, base.advanced(by: ch * bytesPerChannel), bytesPerChannel)
-                    } else if let dst = buffer.int16ChannelData?[ch] {
-                        memcpy(dst, base.advanced(by: ch * bytesPerChannel), bytesPerChannel)
-                    }
-                }
-            }
+        var pcmData = Data()
+        if let pending = pendingPCMByte {
+            pcmData.append(pending)
+            pendingPCMByte = nil
         }
-        return buffer
+        pcmData.append(data)
+        if (pcmData.count & 1) != 0 {
+            pendingPCMByte = pcmData.removeLast()
+            print("[\(logTag)] WARNING: odd-length PCM chunk encountered, carrying 1 byte to next read")
+        }
+        guard !pcmData.isEmpty else { return nil }
+        return createPCMBuffer16kMonoInt16(from: pcmData)
     }
 
     private func createPCMBuffer16kMonoInt16(from data: Data) -> AVAudioPCMBuffer? {
@@ -552,25 +366,5 @@ final class AudioCaptureManager: NSObject {
             }
         }
         return pcmBuffer
-    }
-}
-
-
-// MARK: - Errors
-
-enum AudioCaptureError: LocalizedError {
-    case notAvailable
-    case permissionDenied
-    case recordingFailed
-
-    var errorDescription: String? {
-        switch self {
-        case .notAvailable:
-            return "Screen recording is not available on this device"
-        case .permissionDenied:
-            return "Screen recording permission was denied"
-        case .recordingFailed:
-            return "Failed to start recording"
-        }
     }
 }
