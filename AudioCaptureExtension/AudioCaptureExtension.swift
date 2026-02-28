@@ -24,6 +24,7 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
     private var converter: AVAudioConverter?
     private var converterSourceFormatKey: String?
     private var convertLogCount = 0
+    private var nonContiguousReadLogCount = 0
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         print("[AudioCaptureExtension] Broadcast started with setup info: \(setupInfo ?? [:])")
@@ -62,12 +63,43 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
             print("[AudioCaptureExtension] No block buffer")
             return
         }
-        var length = 0
+        var totalLength = 0
+        var lengthAtOffset = 0
         var dataPointer: UnsafeMutablePointer<Int8>?
-        let status = CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPointer)
-        guard status == kCMBlockBufferNoErr, let data = dataPointer, length > 0 else {
-            print("[AudioCaptureExtension] No data pointer or length=0")
+        let status = CMBlockBufferGetDataPointer(
+            blockBuffer,
+            atOffset: 0,
+            lengthAtOffsetOut: &lengthAtOffset,
+            totalLengthOut: &totalLength,
+            dataPointerOut: &dataPointer
+        )
+        guard status == kCMBlockBufferNoErr, totalLength > 0 else {
+            print("[AudioCaptureExtension] No data pointer or totalLength=0")
             return
+        }
+
+        let processSourceBytes: (UnsafePointer<Int8>, Int) -> Void = { sourceBytes, sourceLength in
+            let isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+
+            let bytesPerFrame = Int(asbd.mBytesPerFrame)
+            let totalBytesPerFrame: Int
+            if isNonInterleaved {
+                totalBytesPerFrame = bytesPerFrame * Int(asbd.mChannelsPerFrame)
+            } else {
+                totalBytesPerFrame = bytesPerFrame
+            }
+            let frameCount = sourceLength / totalBytesPerFrame
+            guard frameCount > 0 else { return }
+
+            // 仅在需要时 dump 原始字节，避免 Extension 实时路径被磁盘 IO 拖慢
+            if self.enableRawDump {
+                self.appendToDebugDumpFile(data: sourceBytes, length: sourceLength, asbd: asbd)
+            }
+            guard let dataToWrite = self.convertTo16kMonoInt16(source: sourceBytes, sourceLength: sourceLength, asbd: asbd, frameCount: frameCount) else {
+                print("[AudioCaptureExtension] convertTo16kMonoInt16 failed, dropping current audio chunk")
+                return
+            }
+            self.writeAudioDataToSharedContainer(dataToWrite)
         }
 
         if !asbdLoggedOnce {
@@ -79,31 +111,31 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
             print("[AudioCaptureExtension] ASBD: sampleRate=\(asbd.mSampleRate) channels=\(asbd.mChannelsPerFrame) bitsPerChannel=\(asbd.mBitsPerChannel) bytesPerFrame=\(asbd.mBytesPerFrame) bytesPerPacket=\(asbd.mBytesPerPacket) formatFlags=0x\(String(asbd.mFormatFlags, radix: 16)) isFloat=\(isFloat) isNonInterleaved=\(isNonInterleaved) isPacked=\(isPacked) isSigned=\(isSigned)")
         }
 
-        let isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
-
-        let bytesPerFrame = Int(asbd.mBytesPerFrame)
-        let totalBytesPerFrame: Int
-        if isNonInterleaved {
-            totalBytesPerFrame = bytesPerFrame * Int(asbd.mChannelsPerFrame)
+        if let dataPointer = dataPointer, lengthAtOffset == totalLength {
+            processSourceBytes(UnsafePointer(dataPointer), totalLength)
         } else {
-            totalBytesPerFrame = bytesPerFrame
+            var copied = Data(count: totalLength)
+            let copyStatus = copied.withUnsafeMutableBytes { raw -> OSStatus in
+                guard let dst = raw.baseAddress else { return -1 }
+                return CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: totalLength, destination: dst)
+            }
+            guard copyStatus == kCMBlockBufferNoErr else {
+                print("[AudioCaptureExtension] CMBlockBufferCopyDataBytes failed status=\(copyStatus)")
+                return
+            }
+            if nonContiguousReadLogCount < 5 {
+                print("[AudioCaptureExtension] Non-contiguous CMBlockBuffer detected: lengthAtOffset=\(lengthAtOffset) totalLength=\(totalLength), fallback to copy")
+                nonContiguousReadLogCount += 1
+            }
+            copied.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                processSourceBytes(base.assumingMemoryBound(to: Int8.self), copied.count)
+            }
         }
-        let frameCount = length / totalBytesPerFrame
-        guard frameCount > 0 else { return }
-
-        // 仅在需要时 dump 原始字节，避免 Extension 实时路径被磁盘 IO 拖慢
-        if enableRawDump {
-            appendToDebugDumpFile(data: data, length: length, asbd: asbd)
-        }
-        guard let dataToWrite = convertTo16kMonoInt16(source: data, sourceLength: length, asbd: asbd, frameCount: frameCount) else {
-            print("[AudioCaptureExtension] convertTo16kMonoInt16 failed, dropping current audio chunk")
-            return
-        }
-        writeAudioDataToSharedContainer(dataToWrite)
     }
 
     /// 将 ASBD 描述的 PCM 转为 16kHz 单声道 Int16。支持 Float32/Int16、任意采样率与声道数。
-    private func convertTo16kMonoInt16(source: UnsafeMutablePointer<Int8>, sourceLength: Int, asbd: AudioStreamBasicDescription, frameCount: Int) -> Data? {
+    private func convertTo16kMonoInt16(source: UnsafePointer<Int8>, sourceLength: Int, asbd: AudioStreamBasicDescription, frameCount: Int) -> Data? {
         let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
         let sampleRate = asbd.mSampleRate
         let channels = Int(asbd.mChannelsPerFrame)
@@ -226,39 +258,27 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
         return nil
     }
 
-    private func createSourcePCMBuffer(data: UnsafeMutablePointer<Int8>, length: Int, asbd: AudioStreamBasicDescription, frameCount: Int, isFloat: Bool, channels: Int) -> AVAudioPCMBuffer? {
+    private func createSourcePCMBuffer(data: UnsafePointer<Int8>, length: Int, asbd: AudioStreamBasicDescription, frameCount: Int, isFloat: Bool, channels: Int) -> AVAudioPCMBuffer? {
         guard let format = createSourceFormat(asbd: asbd),
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else {
             return nil
         }
         buffer.frameLength = AVAudioFrameCount(frameCount)
-        let bytesPerFrame = Int(asbd.mBytesPerFrame)
-        let bytesPerChannelPerFrame = bytesPerFrame / channels
         let isPlanar = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
 
-        if isPlanar {
+        if !isPlanar {
+            // Interleaved 输入必须直接写入唯一 mBuffer，避免 channelData 路径在交错格式下产生布局错误。
+            let audioBuffer = buffer.mutableAudioBufferList.pointee.mBuffers
+            guard let dst = audioBuffer.mData else { return nil }
+            let copyBytes = min(Int(audioBuffer.mDataByteSize), length)
+            memcpy(dst, data, copyBytes)
+            return buffer
+        } else {
             let bytesPerChannel = length / channels
             if isFloat, let dst = buffer.floatChannelData {
                 for ch in 0..<channels { memcpy(dst[ch], data.advanced(by: ch * bytesPerChannel), bytesPerChannel) }
             } else if let dst = buffer.int16ChannelData {
                 for ch in 0..<channels { memcpy(dst[ch], data.advanced(by: ch * bytesPerChannel), bytesPerChannel) }
-            } else { return nil }
-        } else {
-            // Interleaved: 逐帧拷贝到 planar
-            if isFloat, let dst = buffer.floatChannelData {
-                for frame in 0..<frameCount {
-                    let srcOffset = frame * bytesPerFrame
-                    for ch in 0..<channels {
-                        memcpy(dst[ch].advanced(by: frame), data.advanced(by: srcOffset + ch * bytesPerChannelPerFrame), bytesPerChannelPerFrame)
-                    }
-                }
-            } else if let dst = buffer.int16ChannelData {
-                for frame in 0..<frameCount {
-                    let srcOffset = frame * bytesPerFrame
-                    for ch in 0..<channels {
-                        memcpy(dst[ch].advanced(by: frame), data.advanced(by: srcOffset + ch * bytesPerChannelPerFrame), bytesPerChannelPerFrame)
-                    }
-                }
             } else { return nil }
         }
         return buffer
@@ -266,7 +286,7 @@ class AudioCaptureExtension: RPBroadcastSampleHandler {
 
     // MARK: - Debug: 直接 dump CMBlockBuffer 原始字节到文件（零格式解析）
 
-    private func appendToDebugDumpFile(data: UnsafeMutablePointer<Int8>, length: Int, asbd: AudioStreamBasicDescription) {
+    private func appendToDebugDumpFile(data: UnsafePointer<Int8>, length: Int, asbd: AudioStreamBasicDescription) {
         guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else { return }
 
         if debugDumpFileHandle == nil {
