@@ -144,9 +144,14 @@ final class ContentViewModel: NSObject, ObservableObject {
     private var lastUncommittedText: String = ""
     private var stableUncommittedCount: Int = 0
     private var lastCommittedNormalizedText: String = ""
-    private let silenceCommitInterval: TimeInterval = 0.9
-    private let stableCommitThreshold: Int = 3
-    private let minStableCommitChars: Int = 8
+    private var pendingWeakPunctuationCommitChars: Int?
+    private var pendingWeakPunctuationDetectedAt: Date = .distantPast
+    private let weakPunctuationDelay: TimeInterval = 0.3
+    private let silenceCommitInterval: TimeInterval = 0.5
+    private let stableCommitThreshold: Int = 2
+    private let minStableCommitChars: Int = 6
+    private let minWeakPunctuationCommitChars: Int = 10
+    private let maxUncommittedCommitChars: Int = 22
     private let minSilenceCommitChars: Int = 2
 
     override init() {
@@ -229,11 +234,13 @@ final class ContentViewModel: NSObject, ObservableObject {
                 let translatedText = try await TranslationManager.shared.translate(text)
 
                 await MainActor.run {
+                    print("[ContentViewModel] translation updated subtitleID=\(subtitleID) translated=\"\(translatedText)\"")
                     updateTranslatedSubtitle(subtitleID: subtitleID, translatedText: translatedText)
                 }
             } catch {
                 print("Translation error: \(error.localizedDescription)")
                 await MainActor.run {
+                    print("[ContentViewModel] translation failed subtitleID=\(subtitleID) error=\(error.localizedDescription)")
                     updateTranslatedSubtitle(subtitleID: subtitleID, translatedText: "翻译失败")
                 }
             }
@@ -279,6 +286,8 @@ final class ContentViewModel: NSObject, ObservableObject {
         lastUncommittedText = ""
         stableUncommittedCount = 0
         lastCommittedNormalizedText = ""
+        pendingWeakPunctuationCommitChars = nil
+        pendingWeakPunctuationDetectedAt = .distantPast
     }
 
     private func handleRecognitionResultText(_ result: String, isFinal: Bool) {
@@ -292,9 +301,21 @@ final class ContentViewModel: NSObject, ObservableObject {
             committedTranscriptCharCount = 0
         }
 
-        commitByPunctuationIfNeeded()
+        clearPendingWeakPunctuationCandidateIfInvalid()
+
+        commitByStrongPunctuationIfNeeded()
 
         var uncommitted = uncommittedTranscript()
+        if commitByWeakPunctuationIfNeeded(uncommitted) {
+            uncommitted = uncommittedTranscript()
+        }
+        if commitPendingWeakPunctuationIfNeeded() {
+            uncommitted = uncommittedTranscript()
+        }
+        if commitByMaxLengthIfNeeded(uncommitted) {
+            uncommitted = uncommittedTranscript()
+        }
+
         if uncommitted == lastUncommittedText {
             stableUncommittedCount += 1
         } else {
@@ -319,20 +340,81 @@ final class ContentViewModel: NSObject, ObservableObject {
 
     private func handleSilenceCommitIfNeeded() {
         guard isRecording else { return }
+        if commitPendingWeakPunctuationIfNeeded() { return }
+        let uncommitted = uncommittedTranscript()
+        if commitByMaxLengthIfNeeded(uncommitted) { return }
         guard lastResultChangedAt != .distantPast else { return }
         guard Date().timeIntervalSince(lastResultChangedAt) >= silenceCommitInterval else { return }
-        let uncommitted = uncommittedTranscript()
         guard uncommitted.count >= minSilenceCommitChars else { return }
         commitUncommitted(reason: "silence")
     }
 
-    private func commitByPunctuationIfNeeded() {
+    private func commitByStrongPunctuationIfNeeded() {
         while true {
             let uncommitted = uncommittedTranscript()
-            guard let commitLen = commitLengthToLastTerminator(in: uncommitted) else { break }
+            guard let commitLen = commitLengthToLastStrongTerminator(in: uncommitted) else { break }
             let segment = String(uncommitted.prefix(commitLen))
-            guard commitRecognizedSegment(segment, reason: "punctuation") else { break }
+            guard commitRecognizedSegment(segment, reason: "strong-punctuation") else { break }
+            clearPendingWeakPunctuationCandidateIfInvalid()
         }
+    }
+
+    private func commitByWeakPunctuationIfNeeded(_ uncommitted: String) -> Bool {
+        guard let commitLen = commitLengthToLastWeakTerminator(in: uncommitted) else { return false }
+        if commitLen >= minWeakPunctuationCommitChars {
+            let segment = String(uncommitted.prefix(commitLen))
+            if commitRecognizedSegment(segment, reason: "weak-punctuation-length") {
+                clearPendingWeakPunctuationCandidateIfInvalid()
+                return true
+            }
+            return false
+        }
+        updatePendingWeakPunctuationCandidate(commitLen: commitLen)
+        return false
+    }
+
+    private func commitPendingWeakPunctuationIfNeeded() -> Bool {
+        guard let pendingChars = pendingWeakPunctuationCommitChars else { return false }
+        guard pendingChars > committedTranscriptCharCount else {
+            clearPendingWeakPunctuationCandidate()
+            return false
+        }
+        guard pendingChars <= recognitionTranscript.count else { return false }
+        guard pendingWeakPunctuationDetectedAt != .distantPast else { return false }
+        guard Date().timeIntervalSince(pendingWeakPunctuationDetectedAt) >= weakPunctuationDelay else { return false }
+        guard let segment = transcriptSlice(from: committedTranscriptCharCount, to: pendingChars) else { return false }
+        let committed = commitRecognizedSegment(segment, reason: "weak-punctuation-timeout")
+        clearPendingWeakPunctuationCandidate()
+        return committed
+    }
+
+    private func commitByMaxLengthIfNeeded(_ uncommitted: String) -> Bool {
+        guard uncommitted.count >= maxUncommittedCommitChars else { return false }
+        let commitLen = bestCutLengthForMaxCommit(in: uncommitted)
+        guard commitLen > 0 else { return false }
+        let segment = String(uncommitted.prefix(commitLen))
+        return commitRecognizedSegment(segment, reason: "max-length")
+    }
+
+    private func updatePendingWeakPunctuationCandidate(commitLen: Int) {
+        let absolute = committedTranscriptCharCount + commitLen
+        guard absolute <= recognitionTranscript.count else { return }
+        if pendingWeakPunctuationCommitChars != absolute {
+            pendingWeakPunctuationCommitChars = absolute
+            pendingWeakPunctuationDetectedAt = Date()
+        }
+    }
+
+    private func clearPendingWeakPunctuationCandidateIfInvalid() {
+        guard let pending = pendingWeakPunctuationCommitChars else { return }
+        if pending <= committedTranscriptCharCount || pending > recognitionTranscript.count {
+            clearPendingWeakPunctuationCandidate()
+        }
+    }
+
+    private func clearPendingWeakPunctuationCandidate() {
+        pendingWeakPunctuationCommitChars = nil
+        pendingWeakPunctuationDetectedAt = .distantPast
     }
 
     private func commitRemainingUncommitted(reason: String) {
@@ -351,10 +433,12 @@ final class ContentViewModel: NSObject, ObservableObject {
         let committed = normalizeCommittedText(rawText)
         guard !committed.isEmpty else {
             committedTranscriptCharCount += rawText.count
+            clearPendingWeakPunctuationCandidateIfInvalid()
             return false
         }
         if committed == lastCommittedNormalizedText {
             committedTranscriptCharCount += rawText.count
+            clearPendingWeakPunctuationCandidateIfInvalid()
             return false
         }
 
@@ -371,6 +455,7 @@ final class ContentViewModel: NSObject, ObservableObject {
         lastCommittedNormalizedText = committed
         lastUncommittedText = uncommittedTranscript()
         stableUncommittedCount = 0
+        clearPendingWeakPunctuationCandidateIfInvalid()
         print("[ContentViewModel] committed reason=\(reason) text=\"\(committed)\"")
         return true
     }
@@ -394,13 +479,50 @@ final class ContentViewModel: NSObject, ObservableObject {
         return String(recognitionTranscript[idx...])
     }
 
-    private func commitLengthToLastTerminator(in text: String) -> Int? {
+    private func commitLengthToLastStrongTerminator(in text: String) -> Int? {
         var last: Int?
         let terminators: Set<Character> = ["。", "！", "？", ".", "!", "?", ";", "；", "\n"]
         for (i, ch) in text.enumerated() where terminators.contains(ch) {
             last = i + 1
         }
         return last
+    }
+
+    private func commitLengthToLastWeakTerminator(in text: String) -> Int? {
+        var last: Int?
+        let weakTerminators: Set<Character> = ["，", "、", ",", ":", "："]
+        for (i, ch) in text.enumerated() where weakTerminators.contains(ch) {
+            last = i + 1
+        }
+        return last
+    }
+
+    private func bestCutLengthForMaxCommit(in text: String) -> Int {
+        let hardLimit = maxUncommittedCommitChars
+        var idx = 0
+        var lastBreak: Int?
+        let strong: Set<Character> = ["。", "！", "？", ".", "!", "?", ";", "；", "\n"]
+        let weak: Set<Character> = ["，", "、", ",", ":", "："]
+
+        for ch in text {
+            idx += 1
+            if idx > hardLimit { break }
+            if strong.contains(ch) {
+                lastBreak = idx
+            } else if weak.contains(ch) {
+                lastBreak = idx
+            } else if ch.isWhitespace || ch.isNewline {
+                lastBreak = idx
+            }
+        }
+        return lastBreak ?? hardLimit
+    }
+
+    private func transcriptSlice(from startCount: Int, to endCount: Int) -> String? {
+        guard startCount >= 0, endCount >= startCount, endCount <= recognitionTranscript.count else { return nil }
+        let start = recognitionTranscript.index(recognitionTranscript.startIndex, offsetBy: startCount)
+        let end = recognitionTranscript.index(recognitionTranscript.startIndex, offsetBy: endCount)
+        return String(recognitionTranscript[start..<end])
     }
 
     private func normalizeCommittedText(_ text: String) -> String {

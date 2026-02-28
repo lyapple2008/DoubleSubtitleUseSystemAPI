@@ -15,6 +15,7 @@ protocol TranslationDelegate: AnyObject {
 /// Manages text translation using system Translation framework (iOS 17+)
 final class TranslationManager: NSObject, ObservableObject {
     static let shared = TranslationManager()
+    private let logTag = "TranslationManager"
 
     weak var delegate: TranslationDelegate?
 
@@ -42,6 +43,7 @@ final class TranslationManager: NSObject, ObservableObject {
 
         isTranslating = true
         defer { isTranslating = false }
+        print("[\(logTag)] translate start source=\(sourceLanguage.code) target=\(targetLanguage.code) text=\"\(text)\"")
 
         do {
             if #available(iOS 26.0, *) {
@@ -70,6 +72,7 @@ final class TranslationManager: NSObject, ObservableObject {
 
         let response = try await session.translate(text)
         let translatedText = response.targetText
+        print("[\(logTag)] translate success text=\"\(text)\" translated=\"\(translatedText)\"")
 
         delegate?.translationDidComplete(originalText: text, translatedText: translatedText)
         return translatedText
@@ -82,6 +85,7 @@ final class TranslationManager: NSObject, ObservableObject {
         // For iOS versions below 26.0, we use a placeholder
         // In a production app, you would integrate a third-party translation API
         let translatedText = "[翻译: \(text)]"
+        print("[\(logTag)] translate placeholder text=\"\(text)\" translated=\"\(translatedText)\"")
 
         delegate?.translationDidComplete(originalText: text, translatedText: translatedText)
         return translatedText

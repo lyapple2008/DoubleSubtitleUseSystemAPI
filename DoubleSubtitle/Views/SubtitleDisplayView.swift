@@ -4,6 +4,9 @@ import SwiftUI
 struct SubtitleDisplayView: View {
     let currentSubtitle: SubtitleItem?
     let historySubtitles: [SubtitleItem]
+    private var historyByNewestFirst: [SubtitleItem] {
+        historySubtitles.sorted { $0.timestamp > $1.timestamp }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -45,7 +48,7 @@ struct SubtitleDisplayView: View {
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(historySubtitles) { item in
+                        ForEach(historyByNewestFirst) { item in
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(item.originalText)
                                     .font(.caption)
