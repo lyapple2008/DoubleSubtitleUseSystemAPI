@@ -237,7 +237,7 @@ final class AudioCaptureManager: NSObject {
             lastReadPosition = fileSize
 
             if !data.isEmpty, let pcmBuffer = createPCMBufferForRecognition(from: data) {
-                print("[\(logTag)] Read audio size=\(data.count) bytes, PCM frameLength=\(pcmBuffer.frameLength)")
+//                print("[\(logTag)] Read audio size=\(data.count) bytes, PCM frameLength=\(pcmBuffer.frameLength)")
                 appendToDebugAudioFile(pcmBuffer)
                 let delegate = self.delegate
                 DispatchQueue.main.async { [weak self] in
@@ -246,7 +246,7 @@ final class AudioCaptureManager: NSObject {
                         print("[\(self.logTag)] WARNING: delegate is nil, buffer not delivered to speech recognition")
                     } else {
                         delegate?.audioCaptureDidReceiveAudioBuffer(pcmBuffer)
-                        print("[\(self.logTag)] Delivered buffer to delegate frameLength=\(pcmBuffer.frameLength)")
+//                        print("[\(self.logTag)] Delivered buffer to delegate frameLength=\(pcmBuffer.frameLength)")
                     }
                 }
             }

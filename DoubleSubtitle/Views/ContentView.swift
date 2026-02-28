@@ -137,6 +137,17 @@ final class ContentViewModel: NSObject, ObservableObject {
     private var subtitleOverlayManager = SubtitleOverlayManager.shared
 
     private var sampleBufferDisplayLayer: AVSampleBufferDisplayLayer?
+    private var segmentationTimer: Timer?
+    private var recognitionTranscript: String = ""
+    private var committedTranscriptCharCount: Int = 0
+    private var lastResultChangedAt: Date = .distantPast
+    private var lastUncommittedText: String = ""
+    private var stableUncommittedCount: Int = 0
+    private var lastCommittedNormalizedText: String = ""
+    private let silenceCommitInterval: TimeInterval = 0.9
+    private let stableCommitThreshold: Int = 3
+    private let minStableCommitChars: Int = 8
+    private let minSilenceCommitChars: Int = 2
 
     override init() {
         super.init()
@@ -167,6 +178,8 @@ final class ContentViewModel: NSObject, ObservableObject {
     }
 
     func stopRecording() {
+        commitRemainingUncommitted(reason: "manual-stop")
+        stopSegmentationTimer()
         AudioCaptureManager.shared.stopCapture()
         SpeechRecognitionManager.shared.stopRecognition()
         subtitleOverlayManager.stopPiP()
@@ -210,26 +223,193 @@ final class ContentViewModel: NSObject, ObservableObject {
         }
     }
 
-    private func translateText(_ text: String) {
+    private func translateText(for subtitleID: UUID, text: String) {
         Task {
             do {
                 let translatedText = try await TranslationManager.shared.translate(text)
 
                 await MainActor.run {
-                    if let existingSubtitle = currentSubtitle {
-                        currentSubtitle = SubtitleItem(
-                            id: existingSubtitle.id,
-                            originalText: existingSubtitle.originalText,
-                            translatedText: translatedText,
-                            timestamp: existingSubtitle.timestamp,
-                            isFinal: existingSubtitle.isFinal
-                        )
-                    }
+                    updateTranslatedSubtitle(subtitleID: subtitleID, translatedText: translatedText)
                 }
             } catch {
                 print("Translation error: \(error.localizedDescription)")
+                await MainActor.run {
+                    updateTranslatedSubtitle(subtitleID: subtitleID, translatedText: "翻译失败")
+                }
             }
         }
+    }
+
+    private func updateTranslatedSubtitle(subtitleID: UUID, translatedText: String) {
+        guard let index = historySubtitles.lastIndex(where: { $0.id == subtitleID }) else { return }
+        let old = historySubtitles[index]
+        let updated = SubtitleItem(
+            id: old.id,
+            originalText: old.originalText,
+            translatedText: translatedText,
+            timestamp: old.timestamp,
+            isFinal: old.isFinal
+        )
+        historySubtitles[index] = updated
+        subtitleOverlayManager.updateSubtitle(updated)
+    }
+
+    private func startSegmentationTimer() {
+        stopSegmentationTimer()
+        segmentationTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            Task { @MainActor in
+                self.handleSilenceCommitIfNeeded()
+            }
+        }
+        if let timer = segmentationTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    private func stopSegmentationTimer() {
+        segmentationTimer?.invalidate()
+        segmentationTimer = nil
+    }
+
+    private func resetSegmentationState() {
+        recognitionTranscript = ""
+        committedTranscriptCharCount = 0
+        lastResultChangedAt = Date.distantPast
+        lastUncommittedText = ""
+        stableUncommittedCount = 0
+        lastCommittedNormalizedText = ""
+    }
+
+    private func handleRecognitionResultText(_ result: String, isFinal: Bool) {
+        let normalized = normalizeForComparison(result)
+        if normalized != recognitionTranscript {
+            recognitionTranscript = normalized
+            lastResultChangedAt = Date()
+        }
+
+        if committedTranscriptCharCount > recognitionTranscript.count {
+            committedTranscriptCharCount = 0
+        }
+
+        commitByPunctuationIfNeeded()
+
+        var uncommitted = uncommittedTranscript()
+        if uncommitted == lastUncommittedText {
+            stableUncommittedCount += 1
+        } else {
+            lastUncommittedText = uncommitted
+            stableUncommittedCount = 1
+        }
+
+        if !isFinal,
+           stableUncommittedCount >= stableCommitThreshold,
+           uncommitted.count >= minStableCommitChars {
+            commitUncommitted(reason: "stable")
+            uncommitted = uncommittedTranscript()
+        }
+
+        if isFinal {
+            commitRemainingUncommitted(reason: "final")
+            return
+        }
+
+        updateCurrentSubtitlePreview(uncommitted)
+    }
+
+    private func handleSilenceCommitIfNeeded() {
+        guard isRecording else { return }
+        guard lastResultChangedAt != .distantPast else { return }
+        guard Date().timeIntervalSince(lastResultChangedAt) >= silenceCommitInterval else { return }
+        let uncommitted = uncommittedTranscript()
+        guard uncommitted.count >= minSilenceCommitChars else { return }
+        commitUncommitted(reason: "silence")
+    }
+
+    private func commitByPunctuationIfNeeded() {
+        while true {
+            let uncommitted = uncommittedTranscript()
+            guard let commitLen = commitLengthToLastTerminator(in: uncommitted) else { break }
+            let segment = String(uncommitted.prefix(commitLen))
+            guard commitRecognizedSegment(segment, reason: "punctuation") else { break }
+        }
+    }
+
+    private func commitRemainingUncommitted(reason: String) {
+        commitUncommitted(reason: reason)
+        currentSubtitle = nil
+    }
+
+    private func commitUncommitted(reason: String) {
+        let uncommitted = uncommittedTranscript()
+        guard !uncommitted.isEmpty else { return }
+        _ = commitRecognizedSegment(uncommitted, reason: reason)
+    }
+
+    @discardableResult
+    private func commitRecognizedSegment(_ rawText: String, reason: String) -> Bool {
+        let committed = normalizeCommittedText(rawText)
+        guard !committed.isEmpty else {
+            committedTranscriptCharCount += rawText.count
+            return false
+        }
+        if committed == lastCommittedNormalizedText {
+            committedTranscriptCharCount += rawText.count
+            return false
+        }
+
+        let item = SubtitleItem(
+            originalText: committed,
+            translatedText: "翻译中...",
+            isFinal: true
+        )
+        historySubtitles.append(item)
+        subtitleOverlayManager.updateSubtitle(item)
+        translateText(for: item.id, text: committed)
+
+        committedTranscriptCharCount += rawText.count
+        lastCommittedNormalizedText = committed
+        lastUncommittedText = uncommittedTranscript()
+        stableUncommittedCount = 0
+        print("[ContentViewModel] committed reason=\(reason) text=\"\(committed)\"")
+        return true
+    }
+
+    private func updateCurrentSubtitlePreview(_ uncommitted: String) {
+        let preview = normalizeCommittedText(uncommitted)
+        if preview.isEmpty {
+            currentSubtitle = nil
+            return
+        }
+        currentSubtitle = SubtitleItem(
+            originalText: preview,
+            translatedText: "翻译中...",
+            isFinal: false
+        )
+    }
+
+    private func uncommittedTranscript() -> String {
+        guard committedTranscriptCharCount < recognitionTranscript.count else { return "" }
+        let idx = recognitionTranscript.index(recognitionTranscript.startIndex, offsetBy: committedTranscriptCharCount)
+        return String(recognitionTranscript[idx...])
+    }
+
+    private func commitLengthToLastTerminator(in text: String) -> Int? {
+        var last: Int?
+        let terminators: Set<Character> = ["。", "！", "？", ".", "!", "?", ";", "；", "\n"]
+        for (i, ch) in text.enumerated() where terminators.contains(ch) {
+            last = i + 1
+        }
+        return last
+    }
+
+    private func normalizeCommittedText(_ text: String) -> String {
+        let parts = text.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+        return parts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func normalizeForComparison(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -240,12 +420,15 @@ extension ContentViewModel: AudioCaptureDelegate {
         Task { @MainActor in
             isRecording = true
             statusMessage = "音频捕获中..."
+            resetSegmentationState()
+            startSegmentationTimer()
             SpeechRecognitionManager.shared.startRecognition()
         }
     }
 
     nonisolated func audioCaptureDidStop() {
         Task { @MainActor in
+            stopSegmentationTimer()
             statusMessage = ""
         }
     }
@@ -274,39 +457,15 @@ extension ContentViewModel: SpeechRecognitionDelegate {
 
     nonisolated func speechRecognitionDidStop() {
         Task { @MainActor in
+            commitRemainingUncommitted(reason: "recognition-stop")
+            stopSegmentationTimer()
             statusMessage = ""
         }
     }
 
     nonisolated func speechRecognitionDidReceiveResult(_ result: String, isFinal: Bool) {
         Task { @MainActor in
-            if isFinal {
-                // Final result - add to history and translate
-                let translatedText = "翻译中..."
-
-                let newSubtitle = SubtitleItem(
-                    originalText: result,
-                    translatedText: translatedText,
-                    isFinal: true
-                )
-
-                // Add to history
-                historySubtitles.append(newSubtitle)
-                currentSubtitle = nil
-
-                // Trigger translation
-                translateText(result)
-
-                // Update subtitle overlay
-                subtitleOverlayManager.updateSubtitle(newSubtitle)
-            } else {
-                // Interim result - show as current
-                currentSubtitle = SubtitleItem(
-                    originalText: result,
-                    translatedText: "翻译中...",
-                    isFinal: false
-                )
-            }
+            handleRecognitionResultText(result, isFinal: isFinal)
         }
     }
 

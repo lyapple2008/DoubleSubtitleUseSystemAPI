@@ -40,11 +40,11 @@ struct LanguageOption: Identifiable, Hashable {
     }
 
     static var defaultSource: LanguageOption {
-        LanguageOption(code: "en-US", displayName: "English")
+        LanguageOption(code: "zh-Hans-CN", displayName: "简体中文")
     }
 
     static var defaultTarget: LanguageOption {
-        LanguageOption(code: "zh-Hans-CN", displayName: "简体中文")
+        LanguageOption(code: "en-US", displayName: "English")
     }
 
     func hash(into hasher: inout Hasher) {
