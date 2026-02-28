@@ -12,7 +12,8 @@ struct ContentView: View {
         VStack(spacing: 0) {
             LanguageSelectorView(
                 sourceLanguage: $viewModel.sourceLanguage,
-                targetLanguage: $viewModel.targetLanguage
+                targetLanguage: $viewModel.targetLanguage,
+                sourceLanguageSupportsOnDeviceRecognition: viewModel.sourceLanguageSupportsOnDeviceRecognition
             )
             .padding()
 
@@ -115,6 +116,7 @@ final class ContentViewModel: NSObject, ObservableObject {
     @Published var sourceLanguage: LanguageOption = .defaultSource {
         didSet {
             TranslationManager.shared.configure(source: sourceLanguage, target: targetLanguage)
+            sourceLanguageSupportsOnDeviceRecognition = SpeechRecognitionManager.shared.supportsOnDeviceRecognition(for: sourceLanguage.locale)
         }
     }
 
@@ -133,6 +135,7 @@ final class ContentViewModel: NSObject, ObservableObject {
 
     @Published var currentSubtitle: SubtitleItem?
     @Published var historySubtitles: [SubtitleItem] = []
+    @Published var sourceLanguageSupportsOnDeviceRecognition = false
 
     private var subtitleOverlayManager = SubtitleOverlayManager.shared
 
@@ -157,6 +160,7 @@ final class ContentViewModel: NSObject, ObservableObject {
     override init() {
         super.init()
         TranslationManager.shared.configure(source: sourceLanguage, target: targetLanguage)
+        sourceLanguageSupportsOnDeviceRecognition = SpeechRecognitionManager.shared.supportsOnDeviceRecognition(for: sourceLanguage.locale)
     }
 
     /// 用户点击「开始识别」后调用，先请求权限并准备，再通过 onReadyToShowPicker 触发系统 RPSystemBroadcastPickerView。

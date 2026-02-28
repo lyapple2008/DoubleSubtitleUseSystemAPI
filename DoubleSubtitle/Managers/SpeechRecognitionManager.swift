@@ -64,6 +64,12 @@ final class SpeechRecognitionManager: NSObject {
         print("[\(logTag)] configure locale: \(locale.identifier)")
     }
 
+    /// Whether a locale supports on-device (offline) recognition.
+    func supportsOnDeviceRecognition(for locale: Locale) -> Bool {
+        guard let recognizer = SFSpeechRecognizer(locale: locale) else { return false }
+        return recognizer.supportsOnDeviceRecognition
+    }
+
     /// Start speech recognition from external audio buffer (e.g., from ReplayKit)
     func startRecognition() {
         guard !_isRecognizing else { return }

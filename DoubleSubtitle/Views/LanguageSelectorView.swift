@@ -4,6 +4,7 @@ import SwiftUI
 struct LanguageSelectorView: View {
     @Binding var sourceLanguage: LanguageOption
     @Binding var targetLanguage: LanguageOption
+    let sourceLanguageSupportsOnDeviceRecognition: Bool
 
     var body: some View {
         VStack(spacing: 16) {
@@ -12,6 +13,10 @@ struct LanguageSelectorView: View {
                 Text("源语言")
                     .font(.headline)
                     .foregroundColor(.secondary)
+
+                Text(sourceLanguageSupportsOnDeviceRecognition ? "离线识别: 支持" : "离线识别: 不支持")
+                    .font(.caption)
+                    .foregroundColor(sourceLanguageSupportsOnDeviceRecognition ? .green : .orange)
 
                 Spacer()
 
@@ -48,7 +53,8 @@ struct LanguageSelectorView: View {
 #Preview {
     LanguageSelectorView(
         sourceLanguage: .constant(.defaultSource),
-        targetLanguage: .constant(.defaultTarget)
+        targetLanguage: .constant(.defaultTarget),
+        sourceLanguageSupportsOnDeviceRecognition: true
     )
     .padding()
 }
