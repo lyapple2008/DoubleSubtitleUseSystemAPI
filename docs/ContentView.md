@@ -345,7 +345,119 @@ func startRecording(onReadyToShowPicker: @escaping () -> Void) {
 
 ---
 
-## 九、总结
+## 九、handleRecognitionResultText 函数详解（第 297-343 行）
+
+### 函数作用
+
+这个函数是整个**字幕分段显示的核心逻辑**。当语音识别返回结果时，它负责决定：
+1. 哪些文本可以**提交**到历史字幕（已确认的）
+2. 哪些文本需要**保留**作为当前预览（未确认的）
+
+### 整体流程图
+
+```
+语音识别结果
+     ↓
+┌─────────────────────────────────────────┐
+│ 1. 规范化文本，更新识别文本状态           │
+└─────────────────────────────────────────┘
+     ↓
+┌─────────────────────────────────────────┐
+│ 2. 多种分段策略依次检查（优先级从高到低） │
+│    - 强标点（。！？?）                   │
+│    - 弱标点（，、,）                     │
+│    - 最大长度限制                       │
+│    - 稳定性检查（连续N次相同）            │
+│    - 静默超时（无变化0.5秒）             │
+└─────────────────────────────────────────┘
+     ↓
+┌─────────────────────────────────────────┐
+│ 3. 提交确定段落 → 加入历史字幕 + 翻译    │
+└─────────────────────────────────────────┘
+     ↓
+┌─────────────────────────────────────────┐
+│ 4. 剩余未提交文本 → 显示为当前预览字幕    │
+└─────────────────────────────────────────┘
+```
+
+### 关键变量说明
+
+| 变量 | 作用 |
+|------|------|
+| `recognitionTranscript` | 当前识别到的**完整文本**（包含已提交 + 未提交） |
+| `committedTranscriptCharCount` | 已提交的字符数（指针，标记到哪里已处理） |
+| `uncommittedTranscript()` | 未提交文本 = `recognitionTranscript` 从 `committedTranscriptCharCount` 开始的部分 |
+| `currentSubtitle` | 当前显示的**预览字幕**（未确认，可能变化） |
+| `historySubtitles` | 已提交的**历史字幕**列表（已确认，稳定） |
+
+### 分段策略详解（优先级从高到低）
+
+代码中按**优先级**依次检查：
+
+```swift
+// 第 310 行：强标点（句号、感叹号、问号）→ 立即提交
+commitByStrongPunctuationIfNeeded()
+
+// 第 312-321 行：弱标点（逗号）→ 可能提交
+commitByWeakPunctuationIfNeeded(uncommitted)
+commitPendingWeakPunctuationIfNeeded()  // 延迟后提交
+
+// 第 319 行：太长 → 强制提交
+commitByMaxLengthIfNeeded(uncommitted)
+
+// 第 330-335 行：稳定且足够长 → 自动提交
+if stableUncommittedCount >= 2 && uncommitted.count >= 6 {
+    commitUncommitted(reason: "stable")
+}
+
+// 第 345-354 行：静默超时（0.5秒无变化）→ 提交
+if Date().timeIntervalSince(lastResultChangedAt) >= 0.5 {
+    commitUncommitted(reason: "silence")
+}
+```
+
+### 强标点 vs 弱标点
+
+| 类型 | 符号 | 行为 |
+|------|------|------|
+| **强标点** | `。` `！` `？` `.` `!` `?` `;` `；` | 立即提交，无需等待 |
+| **弱标点** | `，` `、` `,` `:` `：` | 需要满足最小字数才提交（默认10字），否则等待更强标点或超时 |
+
+### 显示逻辑
+
+1. **历史字幕**（`historySubtitles`）：
+   - 已提交的稳定内容
+   - 会触发翻译
+   - 按时间戳倒序显示
+
+2. **当前预览**（`currentSubtitle`）：
+   - 剩余未提交的部分
+   - `isFinal = false`，标注"翻译中..."
+   - 实时更新，显示当前识别到的内容
+
+### 实际例子
+
+假设识别到："你好，我是中国人，我来自北京。"
+
+1. 识别到"你好，我是" → `currentSubtitle` 显示 "翻译中... 你好，我是"
+2. 识别到"中国人，我来自北京" → 继续在 `currentSubtitle` 显示
+3. 识别到"北京。"（遇到句号）→
+   - "北京。" 提交到 `historySubtitles`，开始翻译
+   - `currentSubtitle` 清空，等待下一句
+
+### 涉及的 Swift 语法
+
+| 语法 | 含义 |
+|------|------|
+| `String(text[index...])` | Swift 字符串切片，使用 `index` 和 `offsetBy` |
+| `Set<Character>` | 字符集合，用于快速查找 |
+| `.enumerated()` | 遍历同时获取索引和值 |
+| `Timer.scheduledTimer` | 定时器，用于静默检测 |
+| `Date().timeIntervalSince()` | 计算时间间隔 |
+
+---
+
+## 十、总结
 
 | 概念 | 说明 |
 |------|------|
