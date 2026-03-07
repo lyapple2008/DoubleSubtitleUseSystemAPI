@@ -4,7 +4,7 @@ import SwiftUI
 struct SubtitleDisplayView: View {
     let currentSubtitle: SubtitleItem?
     let historySubtitles: [SubtitleItem]
-    private let currentSectionHeight: CGFloat = 170
+    private let currentSectionHeight: CGFloat = 120
 
     private var historyByNewestFirst: [SubtitleItem] {
         historySubtitles.sorted { $0.timestamp > $1.timestamp }
@@ -12,11 +12,6 @@ struct SubtitleDisplayView: View {
 
     private var currentOriginalText: String {
         guard let text = currentSubtitle?.originalText, !text.isEmpty else { return "等待识别中..." }
-        return text
-    }
-
-    private var currentTranslatedText: String {
-        guard let text = currentSubtitle?.translatedText, !text.isEmpty else { return "等待翻译中..." }
         return text
     }
 
@@ -31,30 +26,35 @@ struct SubtitleDisplayView: View {
                 .font(.headline)
                 .foregroundColor(.secondary)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("原文")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("原文")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
 
-                    Text(currentOriginalText)
-                        .font(.body)
-                        .foregroundColor(currentSubtitleColor)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .animation(.easeInOut(duration: 0.2), value: currentOriginalText)
+                        Text(currentOriginalText)
+                            .font(.body)
+                            .foregroundColor(currentSubtitleColor)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .animation(.easeInOut(duration: 0.2), value: currentOriginalText)
 
-                    Text("译文")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(.top, 4)
-
-                    Text(currentTranslatedText)
-                        .font(.body)
-                        .foregroundColor(currentSubtitleColor)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .animation(.easeInOut(duration: 0.2), value: currentTranslatedText)
+                        Color.clear
+                            .frame(height: 1)
+                            .id("current-subtitle-bottom")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .onAppear {
+                    DispatchQueue.main.async {
+                        proxy.scrollTo("current-subtitle-bottom", anchor: .bottom)
+                    }
+                }
+                .onChange(of: currentOriginalText) { _ in
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        proxy.scrollTo("current-subtitle-bottom", anchor: .bottom)
+                    }
+                }
             }
             .frame(height: currentSectionHeight)
             .padding(12)

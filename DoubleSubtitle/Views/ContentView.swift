@@ -337,12 +337,8 @@ final class ContentViewModel: NSObject, ObservableObject {
     }
 
     private func refreshCurrentSubtitlePreview(for liveText: String? = nil) {
-        let text: String
-        if let liveText = liveText {
-            text = normalizeSegmentText(sentenceSegmenter.previewText(for: liveText))
-        } else {
-            text = normalizeSegmentText(sentenceSegmenter.pendingPreviewText)
-        }
+        let fullText = liveText ?? sentenceSegmenter.lastResult
+        let text = normalizeSegmentText(fullText)
 
         if text.isEmpty {
             currentSubtitle = nil
@@ -351,7 +347,7 @@ final class ContentViewModel: NSObject, ObservableObject {
 
         currentSubtitle = SubtitleItem(
             originalText: text,
-            translatedText: "等待断句...",
+            translatedText: "",
             isFinal: false
         )
     }
