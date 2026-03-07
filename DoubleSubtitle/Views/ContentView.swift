@@ -1,6 +1,8 @@
 import SwiftUI
 import AVFoundation
 import ReplayKit
+import UIKit
+import Combine
 
 /// Main content view for the bilingual subtitle app
 struct ContentView: View {
@@ -106,6 +108,9 @@ struct ContentView: View {
             .opacity(0)
             .allowsHitTesting(false)
         )
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            viewModel.handleDidEnterBackground()
+        }
     }
 }
 
@@ -145,9 +150,12 @@ final class ContentViewModel: NSObject, ObservableObject {
     private var translationQueue: [TranslationJob] = []
     private var isTranslationQueueRunning = false
     private var recentCommittedSegments: [CommittedSegmentRecord] = []
+    private var currentSessionHistoryStartIndex = 0
+    private var cancellables: Set<AnyCancellable> = []
     private let dedupeWindowSeconds: TimeInterval = 12
     private let dedupeWindowMaxItems = 40
     private let minimumSegmentContentLength = 2
+    private let translatingPlaceholder = "翻译中..."
 
     private var sampleBufferDisplayLayer: AVSampleBufferDisplayLayer?
 
@@ -155,6 +163,12 @@ final class ContentViewModel: NSObject, ObservableObject {
         super.init()
         TranslationManager.shared.configure(source: sourceLanguage, target: targetLanguage)
         sourceLanguageSupportsOnDeviceRecognition = SpeechRecognitionManager.shared.supportsOnDeviceRecognition(for: sourceLanguage.locale)
+        subtitleOverlayManager.$isPiPActive
+            .receive(on: RunLoop.main)
+            .sink { [weak self] active in
+                self?.isPiPActive = active
+            }
+            .store(in: &cancellables)
     }
 
     /// 用户点击「开始识别」后调用，先请求权限并准备，再通过 onReadyToShowPicker 触发系统 RPSystemBroadcastPickerView。
@@ -176,6 +190,8 @@ final class ContentViewModel: NSObject, ObservableObject {
         sentenceSegmenter.reset()
         recentCommittedSegments.removeAll()
         currentSubtitle = nil
+        currentSessionHistoryStartIndex = historySubtitles.count
+        subtitleOverlayManager.resetDisplayedTexts()
         AudioCaptureManager.shared.delegate = self
         SpeechRecognitionManager.shared.delegate = self
         SpeechRecognitionManager.shared.configure(locale: sourceLanguage.locale)
@@ -189,15 +205,21 @@ final class ContentViewModel: NSObject, ObservableObject {
         AudioCaptureManager.shared.stopCapture()
         SpeechRecognitionManager.shared.stopRecognition()
         subtitleOverlayManager.stopPiP()
+        subtitleOverlayManager.resetDisplayedTexts()
 
         isRecording = false
         currentSubtitle = nil
     }
 
+    func handleDidEnterBackground() {
+        guard isRecording else { return }
+        guard !subtitleOverlayManager.isActive else { return }
+        startPiP()
+    }
+
     func togglePiP() {
         if isPiPActive {
             subtitleOverlayManager.stopPiP()
-            isPiPActive = false
         } else {
             startPiP()
         }
@@ -213,7 +235,6 @@ final class ContentViewModel: NSObject, ObservableObject {
         if let layer = sampleBufferDisplayLayer {
             subtitleOverlayManager.setupPiP(with: layer)
             subtitleOverlayManager.startPiP()
-            isPiPActive = true
         }
     }
 
@@ -241,6 +262,7 @@ final class ContentViewModel: NSObject, ObservableObject {
         )
         historySubtitles[index] = updated
         subtitleOverlayManager.updateSubtitle(updated)
+        syncPiPTranslatedTextFromCurrentSession()
     }
 
     private func submitRecognizedSegment(_ segment: SegmentedSentence) {
@@ -269,6 +291,7 @@ final class ContentViewModel: NSObject, ObservableObject {
         )
         historySubtitles.append(item)
         subtitleOverlayManager.updateSubtitle(item)
+        syncPiPTranslatedTextFromCurrentSession()
         enqueueTranslation(subtitleID: item.id, text: text)
     }
 
@@ -342,6 +365,7 @@ final class ContentViewModel: NSObject, ObservableObject {
 
         if text.isEmpty {
             currentSubtitle = nil
+            subtitleOverlayManager.updateCurrentOriginalText("")
             return
         }
 
@@ -350,6 +374,7 @@ final class ContentViewModel: NSObject, ObservableObject {
             translatedText: "",
             isFinal: false
         )
+        subtitleOverlayManager.updateCurrentOriginalText(text)
     }
 
     /// 处理识别结果，按稳定前缀断句并加入翻译队列
@@ -363,9 +388,28 @@ final class ContentViewModel: NSObject, ObservableObject {
             submitRecognizedSegments(sentenceSegmenter.flushRemaining(reason: .final))
             sentenceSegmenter.reset()
             currentSubtitle = nil
+            subtitleOverlayManager.updateCurrentOriginalText("")
         } else {
             refreshCurrentSubtitlePreview(for: result)
         }
+    }
+
+    private func syncPiPTranslatedTextFromCurrentSession() {
+        guard currentSessionHistoryStartIndex < historySubtitles.count else {
+            subtitleOverlayManager.updateCurrentTranslatedText("")
+            return
+        }
+
+        let sessionItems = historySubtitles[currentSessionHistoryStartIndex...]
+        let mergedTranslated = sessionItems
+            .compactMap { item -> String? in
+                let text = item.translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { return nil }
+                guard text != translatingPlaceholder else { return nil }
+                return text
+            }
+            .joined(separator: "")
+        subtitleOverlayManager.updateCurrentTranslatedText(mergedTranslated)
     }
 
     private func normalizeSegmentText(_ text: String) -> String {
@@ -425,7 +469,10 @@ extension ContentViewModel: AudioCaptureDelegate {
         Task { @MainActor in
             flushPendingSegments(force: true)
             stopSentenceFlushTimer()
+            isRecording = false
             statusMessage = ""
+            subtitleOverlayManager.stopPiP()
+            subtitleOverlayManager.resetDisplayedTexts()
         }
     }
 
@@ -455,8 +502,11 @@ extension ContentViewModel: SpeechRecognitionDelegate {
         Task { @MainActor in
             flushPendingSegments(force: true)
             stopSentenceFlushTimer()
+            isRecording = false
             statusMessage = ""
             currentSubtitle = nil
+            subtitleOverlayManager.stopPiP()
+            subtitleOverlayManager.resetDisplayedTexts()
         }
     }
 

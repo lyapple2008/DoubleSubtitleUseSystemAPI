@@ -96,7 +96,6 @@ final class AudioCaptureManager: NSObject {
 
     private override init() {
         super.init()
-        setupAudioSession()
     }
 
     // MARK: - Public Methods
@@ -147,16 +146,6 @@ final class AudioCaptureManager: NSObject {
     }
 
     // MARK: - Private Methods
-
-    private func setupAudioSession() {
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
-            try session.setActive(true)
-        } catch {
-            print("[AudioCaptureManager] Failed to setup audio session: \(error)")
-        }
-    }
 
     private func startBroadcastStartPolling() {
         stopBroadcastStartPolling()
