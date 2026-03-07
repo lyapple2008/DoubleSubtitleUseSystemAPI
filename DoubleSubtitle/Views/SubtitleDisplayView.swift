@@ -4,49 +4,74 @@ import SwiftUI
 struct SubtitleDisplayView: View {
     let currentSubtitle: SubtitleItem?
     let historySubtitles: [SubtitleItem]
+    private let currentSectionHeight: CGFloat = 170
+
     private var historyByNewestFirst: [SubtitleItem] {
         historySubtitles.sorted { $0.timestamp > $1.timestamp }
     }
 
+    private var currentOriginalText: String {
+        guard let text = currentSubtitle?.originalText, !text.isEmpty else { return "等待识别中..." }
+        return text
+    }
+
+    private var currentTranslatedText: String {
+        guard let text = currentSubtitle?.translatedText, !text.isEmpty else { return "等待翻译中..." }
+        return text
+    }
+
+    private var currentSubtitleColor: Color {
+        guard currentSubtitle != nil else { return .secondary }
+        return currentSubtitle?.isFinal == true ? .primary : .orange
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Current (live) subtitle
-            if let subtitle = currentSubtitle {
+            Text("当前字幕")
+                .font(.headline)
+                .foregroundColor(.secondary)
+
+            ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("原文")
                         .font(.caption)
                         .foregroundColor(.secondary)
 
-                    Text(subtitle.originalText)
+                    Text(currentOriginalText)
                         .font(.body)
-                        .foregroundColor(subtitle.isFinal ? .primary : .orange)
-                        .animation(.easeInOut(duration: 0.2), value: subtitle.originalText)
+                        .foregroundColor(currentSubtitleColor)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .animation(.easeInOut(duration: 0.2), value: currentOriginalText)
 
                     Text("译文")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .padding(.top, 4)
 
-                    Text(subtitle.translatedText)
+                    Text(currentTranslatedText)
                         .font(.body)
-                        .foregroundColor(subtitle.isFinal ? .primary : .orange)
-                        .animation(.easeInOut(duration: 0.2), value: subtitle.translatedText)
+                        .foregroundColor(currentSubtitleColor)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .animation(.easeInOut(duration: 0.2), value: currentTranslatedText)
                 }
-                .padding()
-                .background(Color(.systemGray6))
-                .cornerRadius(12)
-
-                Divider()
-                    .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(height: currentSectionHeight)
+            .padding(12)
+            .background(Color(.systemGray6))
+            .cornerRadius(12)
 
-            // History subtitles
-            if !historySubtitles.isEmpty {
-                Text("历史记录")
-                    .font(.headline)
-                    .foregroundColor(.secondary)
+            Text("历史记录")
+                .font(.headline)
+                .foregroundColor(.secondary)
 
-                ScrollView {
+            ScrollView {
+                if historySubtitles.isEmpty {
+                    Text("暂无历史字幕")
+                        .font(.body)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                } else {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(historyByNewestFirst) { item in
                             VStack(alignment: .leading, spacing: 4) {
@@ -64,24 +89,16 @@ struct SubtitleDisplayView: View {
                             .cornerRadius(8)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxHeight: 200)
             }
-
-            // Empty state
-            if currentSubtitle == nil && historySubtitles.isEmpty {
-                VStack {
-                    Spacer()
-                    Text("点击「开始识别」启动双语字幕")
-                        .font(.body)
-                        .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
-                    Spacer()
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+            .frame(maxHeight: .infinity)
+            .padding(12)
+            .background(Color(.systemGray6))
+            .cornerRadius(12)
         }
         .padding()
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 }
 

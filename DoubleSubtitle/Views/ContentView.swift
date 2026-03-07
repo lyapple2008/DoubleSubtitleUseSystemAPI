@@ -21,8 +21,7 @@ struct ContentView: View {
                 currentSubtitle: viewModel.currentSubtitle,
                 historySubtitles: viewModel.historySubtitles
             )
-
-            Spacer()
+            .frame(maxHeight: .infinity, alignment: .top)
 
             VStack(spacing: 16) {
                 if viewModel.isProcessing {
