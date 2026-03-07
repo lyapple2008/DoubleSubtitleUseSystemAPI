@@ -8,8 +8,8 @@
 
 ```
 ContentView.swift 包含两部分：
-├── 1. ContentView (SwiftUI 视图) - 第 1-111 行
-└── 2. ContentViewModel (业务逻辑) - 第 114-495 行
+├── 1. ContentView (SwiftUI 视图) - 第 1-115 行
+└── 2. ContentViewModel (业务逻辑) - 第 117-540 行
 ```
 
 ---
@@ -20,6 +20,8 @@ ContentView.swift 包含两部分：
 import SwiftUI      // Apple 的现代 UI 框架
 import AVFoundation // 音视频处理
 import ReplayKit    // 屏幕录制/系统音频捕获
+import UIKit        // iOS UI 框架（用于后台通知等）
+import Combine      // 响应式编程框架
 ```
 
 ---
@@ -55,6 +57,16 @@ LanguageSelectorView(
 ```
 - `$viewModel.sourceLanguage` - 传递**引用**而非值
 - 当子视图修改值时，父视图的 viewModel 也会更新
+
+### 4. `.onReceive` - 接收外部事件
+
+```swift
+.onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+    viewModel.handleDidEnterBackground()
+}
+```
+- 监听系统通知（如进入后台、进入前台）
+- 当应用进入后台时，自动调用 `handleDidEnterBackground()`
 
 ---
 
@@ -105,6 +117,19 @@ Button(action: {...}) {
 ```
 - 当值改变时，自动通知所有观察者（SwiftUI 视图）
 - 类似于 Android 的 LiveData
+
+### `@Published` + `didSet` - 值变化监听
+
+```swift
+@Published var sourceLanguage: LanguageOption = .defaultSource {
+    didSet {
+        // 当 sourceLanguage 值改变时，自动执行这里
+        TranslationManager.shared.configure(source: sourceLanguage, target: targetLanguage)
+    }
+}
+```
+- `didSet` 是属性观察器
+- 值改变后自动执行回调
 
 ### `@MainActor` - 主线程执行
 
@@ -198,9 +223,31 @@ guard granted else {
 - 条件不满足时执行 else 分支并提前返回
 - 类似于 if-else，但更简洁，强制要求 return
 
+### 8. Combine 订阅（响应式编程）
+
+```swift
+subtitleOverlayManager.$isPiPActive      // $ 前缀获取 Publisher
+    .receive(on: RunLoop.main)          // 切换到主线程
+    .sink { [weak self] active in       // 订阅变化
+        self?.isPiPActive = active      // 同步到自己的属性
+    }
+    .store(in: &cancellables)           // 保存订阅（防止被释放）
+```
+- `$` 前缀将 `@Published` 属性转换为 Publisher
+- `.receive(on:)` 指定接收线程
+- `.sink { }` 订阅并处理变化
+- `.store(in:)` 保存订阅，防止被释放
+
+### 9. `??` - 空值合并运算符
+
+```swift
+let text = item.translatedText ?? "默认值"
+```
+- 如果左边为 nil，返回右边的默认值
+
 ---
 
-## 七、startRecording 函数详解（第 162-174 行）
+## 七、startRecording 函数详解（第 175-187 行）
 
 ### 原始代码
 
@@ -219,49 +266,6 @@ func startRecording(onReadyToShowPicker: @escaping () -> Void) {
     }
 }
 ```
-
-### 中文翻译
-
-```swift
-// 函数：开始录制
-// 参数：onReadyToShowPicker - 一个闭包参数，表示"准备好显示系统选择器时"要执行的代码
-func startRecording(onReadyToShowPicker: @escaping () -> Void) {
-
-    // 调用 requestPermissions 请求权限
-    // 参数是一个闭包：{ granted in ... }
-    // granted 是权限是否授予的布尔值
-    requestPermissions { [weak self] granted in
-
-        // guard：权限未授予时执行
-        guard granted else {
-            // 创建一个异步任务，在主线程执行
-            Task { @MainActor in
-                // self?. 可能为空的调用
-                self?.showError(message: "需要语音识别权限")
-            }
-            // 提前返回，不再执行后续代码
-            return
-        }
-
-        // 权限已授予，创建异步任务
-        Task { @MainActor in
-            // 调用准备方法，传入 onReadyToShowPicker 闭包
-            self?.performPrepareAndShowPicker(onReadyToShowPicker: onReadyToShowPicker)
-        }
-    }
-}
-```
-
-### 涉及的 Swift 语法
-
-| 语法 | 含义 |
-|------|------|
-| `@escaping () -> Void` | 逃逸闭包参数（函数返回后闭包仍可能被调用） |
-| `{ [weak self] granted in` | 闭包捕获列表，使用弱引用避免循环引用 |
-| `guard granted else { ... }` | 条件守卫，不满足时执行 else 并提前返回 |
-| `self?.showError(...)` | 可选链调用（self 可能为 nil） |
-| `Task { @MainActor in ... }` | Swift 并发，在主线程执行异步任务 |
-| `onReadyToShowPicker: onReadyToShowPicker` | 将闭包参数传递给下一个函数 |
 
 ### 执行流程图
 
@@ -296,23 +300,16 @@ func startRecording(onReadyToShowPicker: @escaping () -> Void) {
        ▼
 ┌──────────────────────────────────┐
 │  performPrepareAndShowPicker()    │
-│  1. 配置 delegate                 │
-│  2. 配置语音识别器语言             │
-│  3. 启动等待广播开始               │
-│  4. 执行 onReadyToShowPicker()    │
+│  1. 重置 sentenceSegmenter        │
+│  2. 清空历史记录                  │
+│  3. 设置本次会话起始索引           │
+│  4. 配置 delegate                 │
+│  5. 配置语音识别器语言             │
+│  6. 启动等待广播开始               │
+│  7. 执行 onReadyToShowPicker()   │
 │     (触发系统弹窗)                │
 └──────────────────────────────────┘
 ```
-
-### 关键点总结
-
-1. **`@escaping`** - 这个闭包会被"保存"下来，在 `performPrepareAndShowPicker` 后面才调用，所以需要 `@escaping`
-
-2. **`[weak self]`** - 防止闭包和 self 之间产生循环引用（内存泄漏）
-
-3. **`guard else`** - Swift 的提前返回语法，类似于 if-else 但更简洁
-
-4. **`Task { @MainActor }`** - Swift 的现代并发方式，确保 UI 操作在主线程
 
 ---
 
@@ -345,7 +342,7 @@ func startRecording(onReadyToShowPicker: @escaping () -> Void) {
 
 ---
 
-## 九、handleRecognitionResultText 函数详解（第 361-374 行）
+## 九、handleRecognitionResultText 函数详解（第 381-395 行）
 
 ### 函数作用
 
@@ -361,19 +358,19 @@ func startRecording(onReadyToShowPicker: @escaping () -> Void) {
      ↓
 ┌─────────────────────────────────────────┐
 │ 1. sentenceSegmenter.processResult()    │
-│    - 找出稳定前缀（最长公共前缀）         │
-│    - 提取已确定的句子（标点/长度断句）   │
+│    - 找出稳定前缀（最长公共前缀）        │
+│    - 提取已确定的句子（标点/长度断句）  │
 │    - 更新已提交文本 committedText       │
 └─────────────────────────────────────────┘
      ↓
 ┌─────────────────────────────────────────┐
 │ 2. submitRecognizedSegments()           │
-│    - 提交确定段落 → 加入历史字幕 + 翻译  │
-│    - 过滤无效内容（纯标点/过短/重复）    │
+│    - 提交确定段落 → 加入历史字幕 + 翻译 │
+│    - 过滤无效内容（纯标点/过短/重复）  │
 └─────────────────────────────────────────┘
      ↓
      ┌─────────────────────────────────────┐
-     │ 3a. isFinal = true（最终结果）       │
+     │ 3a. isFinal = true（最终结果）        │
      │     - 强制 flush 剩余文本            │
      │     - 重置 segmenter                  │
      │     - 清空当前预览                   │
@@ -391,14 +388,42 @@ func startRecording(onReadyToShowPicker: @escaping () -> Void) {
 |------|------|
 | `sentenceSegmenter` | `SpeechSentenceSegmenter` 实例，负责流式文本断句 |
 | `sentenceFlushTimer` | 定时器（0.3秒），定期检测静默超时并刷新分段 |
-| `committedText` | 在 segmenter 内部，已提交的文本（不含未确认部分） |
-| `lastResult` | segmenter 内部保存的最近一次识别结果 |
+| `currentSessionHistoryStartIndex` | 本次识别的字幕起始索引，用于区分历史 |
+| `recentCommittedSegments` | 最近提交的段落记录，用于去重 |
+| `translationQueue` | 翻译任务队列，按顺序执行翻译 |
 | `currentSubtitle` | 当前显示的**预览字幕**（未确认，可能变化） |
 | `historySubtitles` | 已提交的**历史字幕**列表（已确认，稳定） |
 
-### SpeechSentenceSegmenter 断句策略
+### 翻译队列机制
 
-代码使用 `SpeechSentenceSegmenter` 类进行智能断句：
+```swift
+// 1. 加入翻译队列
+private func enqueueTranslation(subtitleID: UUID, text: String) {
+    translationQueue.append(TranslationJob(subtitleID: subtitleID, text: text))
+    processNextTranslationIfNeeded()
+}
+
+// 2. 顺序处理翻译（避免并发冲突）
+private func processNextTranslationIfNeeded() {
+    guard !isTranslationQueueRunning else { return }  // 已有任务运行中
+    guard !translationQueue.isEmpty else { return }    // 队列为空
+
+    isTranslationQueueRunning = true
+    let job = translationQueue.removeFirst()           // 取下一个任务
+
+    Task {
+        let translatedText = try await TranslationManager.shared.translate(job.text)
+        await MainActor.run {
+            // 更新翻译结果
+            self.updateTranslatedSubtitle(...)
+            self.isTranslationQueueRunning = false
+            self.processNextTranslationIfNeeded()       // 继续处理下一个
+        }
+    }
+}
+```
+
+### SpeechSentenceSegmenter 断句策略
 
 ```swift
 // 断句优先级（从高到低）：
@@ -407,28 +432,15 @@ func startRecording(onReadyToShowPicker: @escaping () -> Void) {
 // 3. 停顿断句 - 超过 pauseThreshold（默认1.5秒）无新文本时断句
 ```
 
-### 定时器刷新机制
+### 后台进入处理
 
 ```swift
-// 定时器每 0.3 秒执行一次：
-sentenceFlushTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
-    // 1. 检测静默超时（1.5秒无新文本 → 触发停顿断句）
-    flushPendingSegments(force: false)
-
-    // 2. 刷新当前预览字幕显示
-    refreshCurrentSubtitlePreview()
+func handleDidEnterBackground() {
+    guard isRecording else { return }           // 正在识别中
+    guard !subtitleOverlayManager.isActive else { return }  // PiP 未启动
+    startPiP()                                    // 自动启动画中画
 }
 ```
-
-### 涉及的 Swift 语法
-
-| 语法 | 含义 |
-|------|------|
-| `SpeechSentenceSegmenter` | 自定义类，用于流式文本分段 |
-| `processResult(_:)` | 处理识别结果，返回已确定的句子数组 |
-| `flushRemaining(reason:)` | 强制刷新剩余未提交文本 |
-| `pendingPreviewText` | 计算属性，返回未提交的文本用于预览 |
-| `Timer.scheduledTimer` | 定时器，用于定时检测静默超时 |
 
 ---
 
@@ -444,3 +456,8 @@ sentenceFlushTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) 
 | `@escaping` | 逃逸闭包 |
 | `[weak self]` | 防止循环引用 |
 | `Task { }` | 异步并发 |
+| `Combine` | 响应式编程框架 |
+| `.sink { }` | 订阅 Publisher |
+| `.store(in:)` | 保存订阅，防止释放 |
+| `didSet` | 属性观察器 |
+| `??` | 空值合并运算符 |
