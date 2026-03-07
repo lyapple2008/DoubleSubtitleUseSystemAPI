@@ -9,7 +9,7 @@
 ```
 ContentView.swift 包含两部分：
 ├── 1. ContentView (SwiftUI 视图) - 第 1-111 行
-└── 2. ContentViewModel (业务逻辑) - 第 114-604 行
+└── 2. ContentViewModel (业务逻辑) - 第 114-495 行
 ```
 
 ---
@@ -200,7 +200,7 @@ guard granted else {
 
 ---
 
-## 七、startRecording 函数详解（第 167-179 行）
+## 七、startRecording 函数详解（第 162-174 行）
 
 ### 原始代码
 
@@ -345,13 +345,14 @@ func startRecording(onReadyToShowPicker: @escaping () -> Void) {
 
 ---
 
-## 九、handleRecognitionResultText 函数详解（第 297-343 行）
+## 九、handleRecognitionResultText 函数详解（第 361-374 行）
 
 ### 函数作用
 
-这个函数是整个**字幕分段显示的核心逻辑**。当语音识别返回结果时，它负责决定：
-1. 哪些文本可以**提交**到历史字幕（已确认的）
-2. 哪些文本需要**保留**作为当前预览（未确认的）
+这个函数是整个**字幕分段显示的核心逻辑**。当语音识别返回结果时，它负责：
+1. 将识别文本交给 `SpeechSentenceSegmenter` 进行智能断句
+2. 提交已确定的句子段落（触发翻译）
+3. 更新当前预览字幕（显示未确认部分）
 
 ### 整体流程图
 
@@ -359,101 +360,75 @@ func startRecording(onReadyToShowPicker: @escaping () -> Void) {
 语音识别结果
      ↓
 ┌─────────────────────────────────────────┐
-│ 1. 规范化文本，更新识别文本状态           │
+│ 1. sentenceSegmenter.processResult()    │
+│    - 找出稳定前缀（最长公共前缀）         │
+│    - 提取已确定的句子（标点/长度断句）   │
+│    - 更新已提交文本 committedText       │
 └─────────────────────────────────────────┘
      ↓
 ┌─────────────────────────────────────────┐
-│ 2. 多种分段策略依次检查（优先级从高到低） │
-│    - 强标点（。！？?）                   │
-│    - 弱标点（，、,）                     │
-│    - 最大长度限制                       │
-│    - 稳定性检查（连续N次相同）            │
-│    - 静默超时（无变化0.5秒）             │
+│ 2. submitRecognizedSegments()           │
+│    - 提交确定段落 → 加入历史字幕 + 翻译  │
+│    - 过滤无效内容（纯标点/过短/重复）    │
 └─────────────────────────────────────────┘
      ↓
-┌─────────────────────────────────────────┐
-│ 3. 提交确定段落 → 加入历史字幕 + 翻译    │
-└─────────────────────────────────────────┘
-     ↓
-┌─────────────────────────────────────────┐
-│ 4. 剩余未提交文本 → 显示为当前预览字幕    │
-└─────────────────────────────────────────┘
+     ┌─────────────────────────────────────┐
+     │ 3a. isFinal = true（最终结果）       │
+     │     - 强制 flush 剩余文本            │
+     │     - 重置 segmenter                  │
+     │     - 清空当前预览                   │
+     └─────────────────────────────────────┘
+     │
+     │ 3b. isFinal = false（中间结果）
+     │     - refreshCurrentSubtitlePreview()
+     │     - 显示未提交的文本为预览字幕
+     └─────────────────────────────────────┘
 ```
 
 ### 关键变量说明
 
 | 变量 | 作用 |
 |------|------|
-| `recognitionTranscript` | 当前识别到的**完整文本**（包含已提交 + 未提交） |
-| `committedTranscriptCharCount` | 已提交的字符数（指针，标记到哪里已处理） |
-| `uncommittedTranscript()` | 未提交文本 = `recognitionTranscript` 从 `committedTranscriptCharCount` 开始的部分 |
+| `sentenceSegmenter` | `SpeechSentenceSegmenter` 实例，负责流式文本断句 |
+| `sentenceFlushTimer` | 定时器（0.3秒），定期检测静默超时并刷新分段 |
+| `committedText` | 在 segmenter 内部，已提交的文本（不含未确认部分） |
+| `lastResult` | segmenter 内部保存的最近一次识别结果 |
 | `currentSubtitle` | 当前显示的**预览字幕**（未确认，可能变化） |
 | `historySubtitles` | 已提交的**历史字幕**列表（已确认，稳定） |
 
-### 分段策略详解（优先级从高到低）
+### SpeechSentenceSegmenter 断句策略
 
-代码中按**优先级**依次检查：
+代码使用 `SpeechSentenceSegmenter` 类进行智能断句：
 
 ```swift
-// 第 310 行：强标点（句号、感叹号、问号）→ 立即提交
-commitByStrongPunctuationIfNeeded()
-
-// 第 312-321 行：弱标点（逗号）→ 可能提交
-commitByWeakPunctuationIfNeeded(uncommitted)
-commitPendingWeakPunctuationIfNeeded()  // 延迟后提交
-
-// 第 319 行：太长 → 强制提交
-commitByMaxLengthIfNeeded(uncommitted)
-
-// 第 330-335 行：稳定且足够长 → 自动提交
-if stableUncommittedCount >= 2 && uncommitted.count >= 6 {
-    commitUncommitted(reason: "stable")
-}
-
-// 第 345-354 行：静默超时（0.5秒无变化）→ 提交
-if Date().timeIntervalSince(lastResultChangedAt) >= 0.5 {
-    commitUncommitted(reason: "silence")
-}
+// 断句优先级（从高到低）：
+// 1. 标点断句 - 遇到标点符号（，。！？；,.!?;）立即断句
+// 2. 长度断句 - 超过 maxSentenceLength（默认30字）强制断句
+// 3. 停顿断句 - 超过 pauseThreshold（默认1.5秒）无新文本时断句
 ```
 
-### 强标点 vs 弱标点
+### 定时器刷新机制
 
-| 类型 | 符号 | 行为 |
-|------|------|------|
-| **强标点** | `。` `！` `？` `.` `!` `?` `;` `；` | 立即提交，无需等待 |
-| **弱标点** | `，` `、` `,` `:` `：` | 需要满足最小字数才提交（默认10字），否则等待更强标点或超时 |
+```swift
+// 定时器每 0.3 秒执行一次：
+sentenceFlushTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
+    // 1. 检测静默超时（1.5秒无新文本 → 触发停顿断句）
+    flushPendingSegments(force: false)
 
-### 显示逻辑
-
-1. **历史字幕**（`historySubtitles`）：
-   - 已提交的稳定内容
-   - 会触发翻译
-   - 按时间戳倒序显示
-
-2. **当前预览**（`currentSubtitle`）：
-   - 剩余未提交的部分
-   - `isFinal = false`，标注"翻译中..."
-   - 实时更新，显示当前识别到的内容
-
-### 实际例子
-
-假设识别到："你好，我是中国人，我来自北京。"
-
-1. 识别到"你好，我是" → `currentSubtitle` 显示 "翻译中... 你好，我是"
-2. 识别到"中国人，我来自北京" → 继续在 `currentSubtitle` 显示
-3. 识别到"北京。"（遇到句号）→
-   - "北京。" 提交到 `historySubtitles`，开始翻译
-   - `currentSubtitle` 清空，等待下一句
+    // 2. 刷新当前预览字幕显示
+    refreshCurrentSubtitlePreview()
+}
+```
 
 ### 涉及的 Swift 语法
 
 | 语法 | 含义 |
 |------|------|
-| `String(text[index...])` | Swift 字符串切片，使用 `index` 和 `offsetBy` |
-| `Set<Character>` | 字符集合，用于快速查找 |
-| `.enumerated()` | 遍历同时获取索引和值 |
-| `Timer.scheduledTimer` | 定时器，用于静默检测 |
-| `Date().timeIntervalSince()` | 计算时间间隔 |
+| `SpeechSentenceSegmenter` | 自定义类，用于流式文本分段 |
+| `processResult(_:)` | 处理识别结果，返回已确定的句子数组 |
+| `flushRemaining(reason:)` | 强制刷新剩余未提交文本 |
+| `pendingPreviewText` | 计算属性，返回未提交的文本用于预览 |
+| `Timer.scheduledTimer` | 定时器，用于定时检测静默超时 |
 
 ---
 
