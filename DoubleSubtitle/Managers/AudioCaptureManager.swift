@@ -102,7 +102,7 @@ final class AudioCaptureManager: NSObject {
 
     /// Check if screen recording is available
     var isAvailable: Bool {
-        return true
+        RPScreenRecorder.shared().isAvailable
     }
 
     /// Check if currently recording
@@ -198,6 +198,14 @@ final class AudioCaptureManager: NSObject {
     }
 
     private func checkForNewAudioData() {
+        guard isBroadcastActive() else {
+            if isRecording {
+                print("[\(logTag)] Broadcast flag missing, stopping local capture state")
+                stopCapture()
+            }
+            return
+        }
+
         guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
             return
         }
@@ -242,6 +250,14 @@ final class AudioCaptureManager: NSObject {
         } catch {
             print("[AudioCaptureManager] Error reading audio file: \(error)")
         }
+    }
+
+    private func isBroadcastActive() -> Bool {
+        guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
+            return false
+        }
+        let flagURL = containerURL.appendingPathComponent(broadcastActiveFileName)
+        return FileManager.default.fileExists(atPath: flagURL.path)
     }
 
     private func clearSharedAudioFile() {

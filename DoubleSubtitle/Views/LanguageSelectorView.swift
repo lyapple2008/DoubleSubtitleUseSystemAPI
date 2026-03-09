@@ -5,6 +5,9 @@ struct LanguageSelectorView: View {
     @Binding var sourceLanguage: LanguageOption
     @Binding var targetLanguage: LanguageOption
     let sourceLanguageSupportsOnDeviceRecognition: Bool
+    private var availableTargetLanguages: [LanguageOption] {
+        LanguageOption.targetLanguages.filter { $0.code != sourceLanguage.code }
+    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -37,7 +40,7 @@ struct LanguageSelectorView: View {
                 Spacer()
 
                 Picker("目标语言", selection: $targetLanguage) {
-                    ForEach(LanguageOption.targetLanguages) { language in
+                    ForEach(availableTargetLanguages) { language in
                         Text(language.displayName).tag(language)
                     }
                 }

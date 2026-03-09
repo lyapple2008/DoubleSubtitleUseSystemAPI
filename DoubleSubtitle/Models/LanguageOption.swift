@@ -35,7 +35,7 @@ struct LanguageOption: Identifiable, Hashable {
     }
 
     static let targetLanguages: [LanguageOption] = supportedLanguages.filter { code in
-        // Allow all languages as targets except the source languages to avoid same-language translation
+        // Allow all languages as targets; source/target de-duplication is handled in the UI layer.
         true
     }
 

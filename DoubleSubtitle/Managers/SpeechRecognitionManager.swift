@@ -122,7 +122,9 @@ final class SpeechRecognitionManager: NSObject {
                 print("[\(self.logTag)] recognition task error: \(error.localizedDescription)")
             }
 
-            if error != nil || (result?.isFinal ?? false) {
+            // In long-running streaming sessions we should not stop on `isFinal`.
+            // Stop only when error occurs or when caller explicitly calls stopRecognition().
+            if error != nil {
                 self.recognitionRequest = nil
                 self.recognitionTask = nil
                 self._isRecognizing = false

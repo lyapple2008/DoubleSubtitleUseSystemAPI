@@ -119,8 +119,13 @@ struct ContentView: View {
 final class ContentViewModel: NSObject, ObservableObject {
     @Published var sourceLanguage: LanguageOption = .defaultSource {
         didSet {
-            TranslationManager.shared.configure(source: sourceLanguage, target: targetLanguage)
             sourceLanguageSupportsOnDeviceRecognition = SpeechRecognitionManager.shared.supportsOnDeviceRecognition(for: sourceLanguage.locale)
+            if targetLanguage.code == sourceLanguage.code,
+               let fallbackTarget = LanguageOption.targetLanguages.first(where: { $0.code != sourceLanguage.code }) {
+                targetLanguage = fallbackTarget
+            } else {
+                TranslationManager.shared.configure(source: sourceLanguage, target: targetLanguage)
+            }
         }
     }
 
@@ -149,6 +154,8 @@ final class ContentViewModel: NSObject, ObservableObject {
     private var sentenceFlushTimer: Timer?
     private var translationQueue: [TranslationJob] = []
     private var isTranslationQueueRunning = false
+    private var translationTask: Task<Void, Never>?
+    private var translationSessionID = UUID()
     private var recentCommittedSegments: [CommittedSegmentRecord] = []
     private var currentSessionHistoryStartIndex = 0
     private var cancellables: Set<AnyCancellable> = []
@@ -187,6 +194,7 @@ final class ContentViewModel: NSObject, ObservableObject {
     }
 
     private func performPrepareAndShowPicker(onReadyToShowPicker: @escaping () -> Void) {
+        resetTranslationPipelineForNewSession()
         sentenceSegmenter.reset()
         recentCommittedSegments.removeAll()
         currentSubtitle = nil
@@ -303,7 +311,13 @@ final class ContentViewModel: NSObject, ObservableObject {
     }
 
     private func enqueueTranslation(subtitleID: UUID, text: String) {
-        translationQueue.append(TranslationJob(subtitleID: subtitleID, text: text))
+        translationQueue.append(
+            TranslationJob(
+                subtitleID: subtitleID,
+                text: text,
+                sessionID: translationSessionID
+            )
+        )
         processNextTranslationIfNeeded()
     }
 
@@ -311,28 +325,56 @@ final class ContentViewModel: NSObject, ObservableObject {
         guard !isTranslationQueueRunning else { return }
         guard !translationQueue.isEmpty else { return }
 
-        isTranslationQueueRunning = true
         let job = translationQueue.removeFirst()
+        guard job.sessionID == translationSessionID else {
+            processNextTranslationIfNeeded()
+            return
+        }
+        isTranslationQueueRunning = true
 
-        Task { [weak self] in
+        translationTask = Task { [weak self] in
             guard let self = self else { return }
             do {
                 let translatedText = try await TranslationManager.shared.translate(job.text)
                 await MainActor.run {
+                    guard self.translationSessionID == job.sessionID else {
+                        self.finishTranslationJob()
+                        return
+                    }
                     print("[ContentViewModel] translation updated subtitleID=\(job.subtitleID) translated=\"\(translatedText)\"")
                     self.updateTranslatedSubtitle(subtitleID: job.subtitleID, translatedText: translatedText)
-                    self.isTranslationQueueRunning = false
-                    self.processNextTranslationIfNeeded()
+                    self.finishTranslationJob()
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self.finishTranslationJob()
                 }
             } catch {
                 await MainActor.run {
+                    guard self.translationSessionID == job.sessionID else {
+                        self.finishTranslationJob()
+                        return
+                    }
                     print("[ContentViewModel] translation failed subtitleID=\(job.subtitleID) error=\(error.localizedDescription)")
                     self.updateTranslatedSubtitle(subtitleID: job.subtitleID, translatedText: "翻译失败")
-                    self.isTranslationQueueRunning = false
-                    self.processNextTranslationIfNeeded()
+                    self.finishTranslationJob()
                 }
             }
         }
+    }
+
+    private func finishTranslationJob() {
+        isTranslationQueueRunning = false
+        translationTask = nil
+        processNextTranslationIfNeeded()
+    }
+
+    private func resetTranslationPipelineForNewSession() {
+        translationSessionID = UUID()
+        translationQueue.removeAll()
+        isTranslationQueueRunning = false
+        translationTask?.cancel()
+        translationTask = nil
     }
 
     private func startSentenceFlushTimer() {
@@ -531,6 +573,7 @@ extension ContentViewModel: SpeechRecognitionDelegate {
 private struct TranslationJob {
     let subtitleID: UUID
     let text: String
+    let sessionID: UUID
 }
 
 private struct CommittedSegmentRecord {
