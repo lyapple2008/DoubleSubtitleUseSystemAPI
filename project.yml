@@ -52,9 +52,7 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        NSMicrophoneUsageDescription: "需要麦克风权限来捕获音频进行语音识别"
         NSSpeechRecognitionUsageDescription: "需要语音识别权限来识别音频内容"
-        NSAppleMusicUsageDescription: "需要访问Apple Music来捕获系统音频"
         UIBackgroundModes:
           - audio
         BGTaskSchedulerPermittedIdentifiers:
