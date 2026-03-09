@@ -159,7 +159,93 @@ guard AVPictureInPictureController.isPictureInPictureSupported() else {
 | `stopPictureInPicture()` | 停止画中画 |
 | `isPictureInPictureActive` | 当前是否正在显示 PiP |
 
-### 5. AVPictureInPictureControllerDelegate 代理
+### 5. SourceView（源视图）详解
+
+SourceView 是画中画功能的核心组件之一，它作为 PiP 的"视频源"。
+
+```swift
+private weak var pipSourceView: UIView?  // 源视图引用
+
+private func ensurePiPSourceView() -> UIView? {
+    // 获取当前窗口
+    let windows = UIApplication.shared.connectedScenes
+        .compactMap { $0 as? UIWindowScene }
+        .flatMap { $0.windows }
+    guard let window = windows.first(where: { $0.isKeyWindow }) ?? windows.first else {
+        return nil
+    }
+
+    // 计算源视图大小（16:9 比例，最小 240x135）
+    let sourceFrame = preferredSourceFrame(in: window.bounds)
+
+    // 创建透明源视图
+    let sourceView = UIView(frame: sourceFrame)
+    sourceView.backgroundColor = .clear
+    sourceView.isUserInteractionEnabled = false
+    sourceView.alpha = 0.01  // 必须非零，否则系统不接受
+    window.addSubview(sourceView)
+    pipSourceView = sourceView
+    return sourceView
+}
+
+private func preferredSourceFrame(in windowBounds: CGRect) -> CGRect {
+    let width = max(windowBounds.width, 240)
+    let height = max(width / pipSourceAspectRatio, 135)
+    return CGRect(x: 0, y: 0, width: width, height: height)
+}
+```
+
+**为什么需要 SourceView？**
+
+iOS 的 PiP 功能最初设计用于视频播放场景，系统需要一个"视频源"来捕获画面。即使我们不显示实际视频，也必须提供一个可视区域作为触发源。这里的 SourceView 是完全透明的（alpha = 0.01），用户看不到它，但它满足系统要求。
+
+### 6. 完整组件层级架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     iOS 系统                              │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │              PiP 窗口 (系统控制)                  │    │
+│  │  ┌─────────────────────────────────────────┐    │    │
+│  │  │    AVPictureInPictureVideoCallVC       │    │    │
+│  │  │  ┌─────────────────────────────────┐    │    │    │
+│  │  │  │     UIHostingController         │    │    │    │
+│  │  │  │  ┌─────────────────────────┐    │    │    │    │
+│  │  │  │  │  PiPSubtitleOverlayView │    │    │    │    │
+│  │  │  │  │  ┌─────────────────┐   │    │    │    │    │
+│  │  │  │  │  │ VStack          │   │    │    │    │    │
+│  │  │  │  │  │ ├─ PiPSubtitle  │   │    │    │    │    │
+│  │  │  │  │  │ │   (原文)       │   │    │    │    │    │
+│  │  │  │  │  │ └─ PiPSubtitle  │   │    │    │    │    │
+│  │  │  │  │  │     (译文)       │   │    │    │    │    │
+│  │  │  │  │  └─────────────────┘   │    │    │    │    │
+│  │  │  │  └─────────────────────────┘    │    │    │
+│  │  │  └─────────────────────────────────┘    │    │
+│  │  └─────────────────────────────────────────┘    │    │
+│  └─────────────────────────────────────────────────┘    │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │         sourceView (透明/隐藏的源视图)             │    │
+│  │    位于主窗口，不可见，用于触发 PiP                 │    │
+│  └─────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 7. 内容源配置 (ContentSource)
+
+```swift
+let contentSource = AVPictureInPictureController.ContentSource(
+    activeVideoCallSourceView: sourceView,      // 视频源（透明视图）
+    contentViewController: contentController     // 自定义内容控制器
+)
+let controller = AVPictureInPictureController(contentSource: contentSource)
+```
+
+ContentSource 是 PiP 的核心配置，绑定两个关键部分：
+- `activeVideoCallSourceView`: 实际的"视频"来源（我们用透明视图）
+- `contentViewController`: 要显示的 UI 内容（我们的字幕界面）
+
+### 8. AVPictureInPictureControllerDelegate 代理
 
 ```swift
 extension SubtitleOverlayManager: AVPictureInPictureControllerDelegate {
@@ -180,7 +266,7 @@ extension SubtitleOverlayManager: AVPictureInPictureControllerDelegate {
 
 ---
 
-## 三、双语字幕显示实现
+## 九、双语字幕显示实现
 
 ### 1. 字幕显示架构
 
@@ -320,7 +406,7 @@ private struct PiPSubtitlePanel: View {
 
 ---
 
-## 四、总结
+## 十、总结
 
 | 概念 | 说明 |
 |------|------|

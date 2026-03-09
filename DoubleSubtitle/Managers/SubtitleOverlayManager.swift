@@ -17,6 +17,7 @@ final class SubtitleOverlayManager: NSObject, ObservableObject {
     private var pipController: AVPictureInPictureController?
     private weak var pipSourceView: UIView?
     private let pipSourceAspectRatio: CGFloat = 16.0 / 9.0
+    private var allowsAutomaticPiPStartFromInline = false
 
     private override init() {
         super.init()
@@ -65,7 +66,7 @@ final class SubtitleOverlayManager: NSObject, ObservableObject {
         )
         let controller = AVPictureInPictureController(contentSource: contentSource)
         controller.delegate = self
-        controller.canStartPictureInPictureAutomaticallyFromInline = true
+        controller.canStartPictureInPictureAutomaticallyFromInline = allowsAutomaticPiPStartFromInline
 
         pipController = controller
         isPiPPossible = true
@@ -82,6 +83,13 @@ final class SubtitleOverlayManager: NSObject, ObservableObject {
         pipController.startPictureInPicture()
     }
 
+    /// Enable/disable automatic PiP start when app goes background.
+    func setAutomaticPiPStartFromInlineEnabled(_ enabled: Bool) {
+        allowsAutomaticPiPStartFromInline = enabled
+        pipController?.canStartPictureInPictureAutomaticallyFromInline = enabled
+        print("[SubtitleOverlayManager] setAutomaticPiPStartFromInlineEnabled=\(enabled)")
+    }
+
     /// Stop Picture-in-Picture
     func stopPiP() {
         guard let pipController = pipController else { return }
@@ -89,6 +97,25 @@ final class SubtitleOverlayManager: NSObject, ObservableObject {
         if pipController.isPictureInPictureActive {
             pipController.stopPictureInPicture()
         }
+    }
+
+    /// Force-disable PiP and release underlying controller/source view.
+    /// Use this when recognition session ends, to avoid stale auto-start behavior.
+    func teardownPiP() {
+        allowsAutomaticPiPStartFromInline = false
+        if let pipController = pipController {
+            pipController.canStartPictureInPictureAutomaticallyFromInline = false
+            if pipController.isPictureInPictureActive {
+                pipController.stopPictureInPicture()
+            }
+            pipController.delegate = nil
+        }
+        pipController = nil
+        pipSourceView?.removeFromSuperview()
+        pipSourceView = nil
+        isPiPActive = false
+        isPiPPossible = AVPictureInPictureController.isPictureInPictureSupported()
+        print("[SubtitleOverlayManager] teardownPiP")
     }
 
     /// Update current subtitle item (kept for compatibility with existing call sites).
@@ -152,24 +179,28 @@ final class SubtitleOverlayManager: NSObject, ObservableObject {
 
 extension SubtitleOverlayManager: AVPictureInPictureControllerDelegate {
     func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        print("[SubtitleOverlayManager] pictureInPictureControllerWillStartPictureInPicture")
         DispatchQueue.main.async {
             self.isPiPActive = true
         }
     }
 
     func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        print("[SubtitleOverlayManager] pictureInPictureControllerDidStartPictureInPicture")
         DispatchQueue.main.async {
             self.isPiPActive = true
         }
     }
 
     func pictureInPictureControllerWillStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        print("[SubtitleOverlayManager] pictureInPictureControllerWillStopPictureInPicture")
         DispatchQueue.main.async {
             self.isPiPActive = false
         }
     }
 
     func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        print("[SubtitleOverlayManager] pictureInPictureControllerDidStopPictureInPicture")
         DispatchQueue.main.async {
             self.isPiPActive = false
         }

@@ -38,8 +38,12 @@ struct ContentView: View {
 
                 if viewModel.isRecording {
                     Button(action: {
-                        triggerSystemPicker = true
                         viewModel.stopRecording()
+                        // Trigger system picker after local stop state is fully turned off
+                        // to avoid background-transition races that may auto-start PiP.
+                        DispatchQueue.main.async {
+                            triggerSystemPicker = true
+                        }
                     }) {
                         HStack {
                             Image(systemName: "stop.circle.fill")
@@ -117,6 +121,7 @@ struct ContentView: View {
 /// ViewModel for ContentView
 @MainActor
 final class ContentViewModel: NSObject, ObservableObject {
+    private let logTag = "ContentViewModel"
     @Published var sourceLanguage: LanguageOption = .defaultSource {
         didSet {
             sourceLanguageSupportsOnDeviceRecognition = SpeechRecognitionManager.shared.supportsOnDeviceRecognition(for: sourceLanguage.locale)
@@ -159,6 +164,7 @@ final class ContentViewModel: NSObject, ObservableObject {
     private var recentCommittedSegments: [CommittedSegmentRecord] = []
     private var currentSessionHistoryStartIndex = 0
     private var cancellables: Set<AnyCancellable> = []
+    private var shouldAutoStartPiPOnBackground = false
     private let dedupeWindowSeconds: TimeInterval = 12
     private let dedupeWindowMaxItems = 40
     private let minimumSegmentContentLength = 2
@@ -173,7 +179,14 @@ final class ContentViewModel: NSObject, ObservableObject {
         subtitleOverlayManager.$isPiPActive
             .receive(on: RunLoop.main)
             .sink { [weak self] active in
-                self?.isPiPActive = active
+                guard let self = self else { return }
+                self.isPiPActive = active
+                // Safety net: PiP must never stay active when recognition is not running.
+                if active && !self.isRecording {
+                    print("[\(self.logTag)] PiP became active while not recording, force stopping")
+                    self.subtitleOverlayManager.setAutomaticPiPStartFromInlineEnabled(false)
+                    self.subtitleOverlayManager.teardownPiP()
+                }
             }
             .store(in: &cancellables)
     }
@@ -208,11 +221,14 @@ final class ContentViewModel: NSObject, ObservableObject {
     }
 
     func stopRecording() {
+        print("[\(logTag)] stopRecording called")
+        shouldAutoStartPiPOnBackground = false
+        subtitleOverlayManager.setAutomaticPiPStartFromInlineEnabled(false)
         flushPendingSegments(force: true)
         stopSentenceFlushTimer()
         AudioCaptureManager.shared.stopCapture()
         SpeechRecognitionManager.shared.stopRecognition()
-        subtitleOverlayManager.stopPiP()
+        subtitleOverlayManager.teardownPiP()
         subtitleOverlayManager.resetDisplayedTexts()
 
         isRecording = false
@@ -220,7 +236,13 @@ final class ContentViewModel: NSObject, ObservableObject {
     }
 
     func handleDidEnterBackground() {
-        guard isRecording else { return }
+        guard isRecording, shouldAutoStartPiPOnBackground else {
+            print("[\(logTag)] didEnterBackground while not actively recognizing, ensure PiP disabled")
+            subtitleOverlayManager.setAutomaticPiPStartFromInlineEnabled(false)
+            subtitleOverlayManager.teardownPiP()
+            return
+        }
+        print("[\(logTag)] didEnterBackground while recording, allow PiP")
         guard !subtitleOverlayManager.isActive else { return }
         startPiP()
     }
@@ -501,6 +523,8 @@ extension ContentViewModel: AudioCaptureDelegate {
     nonisolated func audioCaptureDidStart() {
         Task { @MainActor in
             isRecording = true
+            shouldAutoStartPiPOnBackground = true
+            subtitleOverlayManager.setAutomaticPiPStartFromInlineEnabled(true)
             statusMessage = "音频捕获中..."
             startSentenceFlushTimer()
             SpeechRecognitionManager.shared.startRecognition()
@@ -509,11 +533,13 @@ extension ContentViewModel: AudioCaptureDelegate {
 
     nonisolated func audioCaptureDidStop() {
         Task { @MainActor in
+            shouldAutoStartPiPOnBackground = false
+            subtitleOverlayManager.setAutomaticPiPStartFromInlineEnabled(false)
             flushPendingSegments(force: true)
             stopSentenceFlushTimer()
             isRecording = false
             statusMessage = ""
-            subtitleOverlayManager.stopPiP()
+            subtitleOverlayManager.teardownPiP()
             subtitleOverlayManager.resetDisplayedTexts()
         }
     }
@@ -542,12 +568,14 @@ extension ContentViewModel: SpeechRecognitionDelegate {
 
     nonisolated func speechRecognitionDidStop() {
         Task { @MainActor in
+            shouldAutoStartPiPOnBackground = false
+            subtitleOverlayManager.setAutomaticPiPStartFromInlineEnabled(false)
             flushPendingSegments(force: true)
             stopSentenceFlushTimer()
             isRecording = false
             statusMessage = ""
             currentSubtitle = nil
-            subtitleOverlayManager.stopPiP()
+            subtitleOverlayManager.teardownPiP()
             subtitleOverlayManager.resetDisplayedTexts()
         }
     }
