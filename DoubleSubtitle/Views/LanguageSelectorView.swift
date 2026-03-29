@@ -1,0 +1,63 @@
+import SwiftUI
+
+/// Language selector component
+struct LanguageSelectorView: View {
+    @Binding var sourceLanguage: LanguageOption
+    @Binding var targetLanguage: LanguageOption
+    let sourceLanguageSupportsOnDeviceRecognition: Bool
+    private var availableTargetLanguages: [LanguageOption] {
+        LanguageOption.targetLanguages.filter { $0.code != sourceLanguage.code }
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            // Source language selector
+            HStack {
+                Text("源语言")
+                    .font(.headline)
+                    .foregroundColor(.secondary)
+
+                Text(sourceLanguageSupportsOnDeviceRecognition ? "离线识别: 支持" : "离线识别: 不支持")
+                    .font(.caption)
+                    .foregroundColor(sourceLanguageSupportsOnDeviceRecognition ? .green : .orange)
+
+                Spacer()
+
+                Picker("源语言", selection: $sourceLanguage) {
+                    ForEach(LanguageOption.sourceLanguages) { language in
+                        Text(language.displayName).tag(language)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+
+            // Target language selector
+            HStack {
+                Text("目标语言")
+                    .font(.headline)
+                    .foregroundColor(.secondary)
+
+                Spacer()
+
+                Picker("目标语言", selection: $targetLanguage) {
+                    ForEach(availableTargetLanguages) { language in
+                        Text(language.displayName).tag(language)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+        }
+        .padding()
+        .background(Color(.systemGray6))
+        .cornerRadius(12)
+    }
+}
+
+#Preview {
+    LanguageSelectorView(
+        sourceLanguage: .constant(.defaultSource),
+        targetLanguage: .constant(.defaultTarget),
+        sourceLanguageSupportsOnDeviceRecognition: true
+    )
+    .padding()
+}
